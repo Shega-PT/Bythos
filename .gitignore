@@ -1,0 +1,48 @@
+# ============================================================================
+# Bythos Protocol — .gitignore
+# ============================================================================
+
+# --- Rust ---
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# --- C/C++ ---
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.dSYM/
+*.d
+
+# --- Build directories ---
+c_core/build/
+build/
+cmake-build-*/
+
+# --- IDEs e Editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Debug ---
+*.dSYM/
+core
+vgcore.*
+
+# --- Documentação gerada ---
+docs/html/
+docs/_build/
+
+# --- Overflow files ---
+*.bak
+*.tmp
+*.orig
