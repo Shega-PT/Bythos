@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # FFI Protocol — Funções extern "C" para Interoperação C/C++ (Bythos v3.0.0)
 //!
 //! Este módulo fornece a camada de FFI (Foreign Function Interface) para

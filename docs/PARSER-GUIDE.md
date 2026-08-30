@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — Guia do Parser FSM
 
+Autor: ShegaPT | Licença: GPL-3.0
+
 ## Visão Geral
 
 O parser FSM (Finite State Machine) reconstrói mensagens Bythos a partir de um fluxo de bytes, processando cada byte individualmente. É ideal para receção byte-a-byte em CAN bus ou Serial.
@@ -75,7 +77,7 @@ for &byte in &message_bytes {
     match parser.feed(byte) {
         ParserError::Ok => continue,
         ParserError::ErrStart => { /* byte inválido, reiniciar */ }
-        ParserError::ErrCrc => { /* CRC inválido, mensagem corrompida */ }
+        ParserError::ErrChecksum => { /* CRC inválido, mensagem corrompida */ }
         _ => { /* outro erro */ }
     }
 }
@@ -92,7 +94,7 @@ if parser.has_message() {
 ## Uso via FFI (C/C++)
 
 ```c
-#include "protocol_ffi.h"
+#include "bythos.h"
 
 BythosParser parser;
 bythos_parser_init(&parser, 0x42);
@@ -100,7 +102,7 @@ bythos_parser_init(&parser, 0x42);
 for (int i = 0; i < len; i++) {
     BythosParserResult result = bythos_parser_feed(&parser, data[i]);
     if (result == PARSER_OK_MSG) {
-        TLVMessage* msg = bythos_parser_get_message(&parser);
+        BythosMessage* msg = bythos_parser_get_message(&parser);
         // Processar msg...
     }
 }
@@ -119,9 +121,9 @@ for (int i = 0; i < len; i++) {
 | ErrTlvCount   | 4      | Número de TLVs inválido           |
 | ErrTlvId      | 5      | ID de campo TLV inválido          |
 | ErrTlvLen     | 6      | Tamanho de campo TLV inválido     |
-| ErrCrc        | 7      | Checksum CRC16 inválido           |
-| ErrBufferFull | 8      | Buffer interno cheio              |
-| ErrSignature  | 9      | Assinatura inválida               |
+| ErrChecksum   | 7      | Checksum CRC16 inválido           |
+| ErrSignature  | 8      | Assinatura inválida               |
+| ErrTimeout    | 9      | Timeout entre bytes (frame gap)   |
 
 ---
 
@@ -131,4 +133,4 @@ Após reconstruir a mensagem, o parser valida:
 1. **CRC-16/CCITT** — integridade dos dados
 2. **Signature** — autenticidade (se key != 0x00)
 
-Se a validação falhar, `ParserError::ErrCrc` ou `ParserError::ErrSignature` é retornado.
+Se a validação falhar, `ParserError::ErrChecksum` ou `ParserError::ErrSignature` é retornado.

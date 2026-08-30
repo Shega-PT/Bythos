@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # Testes de Integração — Bythos v3.0.0
 //!
 //! Testes abrangentes para o protocolo Bythos v3.0.0.

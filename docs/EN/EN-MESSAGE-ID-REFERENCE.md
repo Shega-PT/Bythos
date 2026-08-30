@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — MsgID Reference
 
+Author: ShegaPT | License: GPL-3.0
+
 ## System Messages (0x10-0x1B)
 
 | MsgID | Name      | Default Priority  | Description                                     |

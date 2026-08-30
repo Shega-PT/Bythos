@@ -1,11 +1,12 @@
 # Bythos v3.0.0 — Developer Tips
 
+Author: ShegaPT | License: GPL-3.0
+
 ## Compilation
 
 ### Host (Linux/macOS — testing and development)
 
 ```bash
-cd rust/
 RUSTUP_TOOLCHAIN=stable cargo test
 RUSTUP_TOOLCHAIN=stable cargo check
 ```
@@ -13,7 +14,6 @@ RUSTUP_TOOLCHAIN=stable cargo check
 ### ESP32 (production)
 
 ```bash
-cd rust/
 cargo build --release --target xtensa-esp32-none-elf
 ```
 
@@ -124,7 +124,7 @@ Example:
 ## Project Structure
 
 ```text
-rust/
+Bythos/
 ├── Cargo.toml          # Crate configuration
 ├── src/
 │   ├── lib.rs          # Crate root (conditional no_std)
@@ -141,9 +141,9 @@ rust/
 │       ├── fsm.rs      # 9-state FSM parser
 │       └── ffi.rs      # Parser FFI bindings
 ├── tests/
-│   └── test_acp.rs     # Integration tests
+│   └── test_bythos.rs  # Integration tests
 └── docs/               # Protocol documentation
-    ├── ACP-SPECIFICATION.md
+    ├── EN-BYTHOS-SPECIFICATION.md
     ├── FIELD-ID-REFERENCE.md
     ├── MESSAGE-ID-REFERENCE.md
     ├── CAN-ID-MAPPING.md

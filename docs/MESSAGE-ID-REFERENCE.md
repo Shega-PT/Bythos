@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — Referência de MsgIDs
 
+Autor: ShegaPT | Licença: GPL-3.0
+
 ## Mensagens do Sistema (0x10-0x1B)
 
 | MsgID | Nome      | Prioridade por defeito | Descrição                                     |

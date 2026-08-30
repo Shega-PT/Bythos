@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — Examples
 
+Author: ShegaPT | License: GPL-3.0
+
 ## Example 1: Build and Validate Message
 
 ```rust
@@ -9,11 +11,11 @@ use bythos::protocol::codec::validate_message;
 let mut builder = TLVBuilder::new(0x06, 0x42);
 builder.set_seq(1);
 
-builder.add_u8_field(0xC0, 2).unwrap();        // SystemState = Ready
-builder.add_f32_field(0x26, -33.8999).unwrap(); // GPS Latitude
-builder.add_f32_field(0x27, 151.2093).unwrap(); // GPS Longitude
-builder.add_f32_field(0x30, 1.5).unwrap();      // IMU Roll
-builder.add_u32_field(0x82, 3600).unwrap();     // SystemUptime
+builder.add_u8_field(0, 2).unwrap();        // SystemState = Ready (ID=0 → 0xC0)
+builder.add_f32_field(6, -33.8999).unwrap(); // GPS Latitude (ID=6 → 0x26)
+builder.add_f32_field(7, 151.2093).unwrap(); // GPS Longitude (ID=7 → 0x27)
+builder.add_f32_field(16, 1.5).unwrap();     // IMU Roll (ID=16 → 0x30)
+builder.add_u32_field(2, 3600).unwrap();     // SystemUptime (ID=2 → 0x82)
 
 let mut buffer = [0u8; 1098];
 let size = builder.build(0x11, &mut buffer).unwrap();
@@ -32,7 +34,7 @@ let mut parser = Parser::new(0x42);
 for &byte in &buffer[..size] {
     match parser.feed(byte) {
         ParserError::Ok => {}
-        ParserError::ErrCrc => eprintln!("Invalid CRC!"),
+        ParserError::ErrChecksum => eprintln!("Invalid CRC!"),
         _ => {}
     }
 }
@@ -53,8 +55,8 @@ use bythos::parser::fsm::Parser;
 // 1. Build
 let mut builder = TLVBuilder::new(0x06, 0x42);
 builder.set_seq(42);
-builder.add_u8_field(0xC0, 2).unwrap();
-builder.add_f32_field(0x30, 1.5).unwrap();
+builder.add_u8_field(0, 2).unwrap();
+builder.add_f32_field(16, 1.5).unwrap();
 
 let mut buffer = [0u8; 1098];
 let size = builder.build(0x11, &mut buffer).unwrap();
@@ -99,30 +101,29 @@ assert!(is_safety_bus_id(safety_id));
 ## Example 5: FFI (C)
 
 ```c
-#include "protocol_ffi.h"
+#include "bythos.h"
 #include <stdio.h>
 
 int main() {
-    TLVMessage msg;
-    bythos_init(&msg, 0x06, 0x42);
+    BythosMessage msg;
+    bythos_init(&msg, 0x06, 0x11);  // node_id=0x06, msg_id=0x11 (Telemetry)
     bythos_set_seq(&msg, 1);
 
-    bythos_add_tlv_uint8(&msg, 0xC0, 2);
-    bythos_add_tlv_float(&msg, 0x26, -33.9f);
-    bythos_add_tlv_float(&msg, 0x27, 151.2f);
+    bythos_tlv_add_u8(&msg, 0xC0, 2);
+    bythos_tlv_add_f32(&msg, 0x26, -33.9f);
+    bythos_tlv_add_f32(&msg, 0x27, 151.2f);
 
     uint8_t buffer[1098];
-    ssize_t size = bythos_build_message(&msg, 0x11, buffer, sizeof(buffer));
+    bythos_ssize_t size = bythos_build(&msg, 0x11, 0x42, buffer, sizeof(buffer));
 
     if (size > 0) {
         printf("Message built: %zd bytes\n", size);
 
         // Validate
-        uint8_t result = bythos_validate_message(buffer, size, 0x42);
-        printf("Validation: %s\n", result == 0 ? "OK" : "ERROR");
+        uint8_t result = bythos_validate(buffer, size);
+        printf("Validation: %s\n", result != 0xFF ? "OK" : "ERROR");
     }
 
-    bythos_free_message(&msg);
     return 0;
 }
 ```
@@ -130,14 +131,14 @@ int main() {
 ## Example 6: FieldID Encoding
 
 ```rust
-use bythos::protocol::types::*;
+use bythos::protocol::types::{field_id_encode, field_id_decode, FieldType};
 
-// Encode: type=f32(1), id=6 → GPS Latitude
-let field_id = FieldId::encode(FieldType::Gps, 6);
+// Encode: type=Float32(1), id=6 → GPS Latitude
+let field_id = field_id_encode(FieldType::Float32 as u8, 6);
 assert_eq!(field_id, 0x26);
 
 // Decode
-let (tipo, id) = FieldId::decode(0x26);
-assert_eq!(tipo, FieldType::Gps);
+let (tipo, id) = field_id_decode(0x26);
+assert_eq!(tipo, 1); // Float32
 assert_eq!(id, 6);
 ```

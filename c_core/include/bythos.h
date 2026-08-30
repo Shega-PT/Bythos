@@ -99,7 +99,7 @@ typedef enum {
 #define BYTHOS_FIELD_IMU_GYRO_Z       0x38  // TYPE=1(f32) + ID=0x18
 #define BYTHOS_FIELD_IMU_YAW_RATE     0x39  // TYPE=1(f32) + ID=0x19
 
-// --- Voo — Tipo 1 (f32), IDs 0x20-0x24 ---
+// --- Voo — Tipo 1 (f32), IDs 0x20-0x23; LoopTime é u16 (0xA2) ---
 #define BYTHOS_FIELD_FLIGHT_ALT_GPS   0x40  // TYPE=1(f32) + ID=0x20
 #define BYTHOS_FIELD_FLIGHT_ALT_BARO  0x41  // TYPE=1(f32) + ID=0x21
 #define BYTHOS_FIELD_FLIGHT_VSPEED    0x42  // TYPE=1(f32) + ID=0x22

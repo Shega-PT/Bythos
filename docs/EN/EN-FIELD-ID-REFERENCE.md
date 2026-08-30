@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — FieldID Reference
 
+Author: ShegaPT | License: GPL-3.0
+
 ## FieldIDs Encoded by Domain
 
 ### GPS (Type 1 = f32, IDs 0x06-0x0B)

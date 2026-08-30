@@ -53,7 +53,10 @@ static const uint16_t crc16_table[256] = {
     0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
 };
 
-static uint8_t crc8_table[256] = {
+/// Tabela CRC-8/SMBUS (polinómio 0x07) — 256 entradas.
+/// Marcação `const` permite ao compilador colocar em flash (ROM)
+/// em microcontroladores, poupando memória RAM valiosa.
+static const uint8_t crc8_table[256] = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
     0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
     0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65,
@@ -117,11 +120,17 @@ static int is_valid_msg_id(uint8_t id) {
  */
 /**
  * Verifica se um field_id tem um tipo válido (bits 7-5).
- * Aceita qualquer valor 0-7, pois o protocolo suporta qualquer field_type.
- * A validação específica do domínio é feita pelo aplicação.
+ *
+ * Nota: como os bits 7-5 formam apenas 3 bits (valores 0-7), esta
+ * validação é trivialmente verdadeira para qualquer byte. A função
+ * é mantida por consistência com a API Rust (is_valid_field_id) e
+ * para futura expansão caso o protocolo alargue o espaço de tipos.
+ *
+ * A validação específica do domínio (ex: GPS, IMU) é responsibility
+ * da aplicação, não do protocolo.
  *
  * @param field_id ID do campo (8 bits)
- * @return         1 se válido, 0 caso contrário
+ * @return         1 se válido (sempre true para qualquer byte)
  */
 static int is_valid_field_id(uint8_t field_id) {
     uint8_t field_type = (field_id >> 5) & 0x07;
@@ -307,8 +316,12 @@ bythos_ssize_t bythos_build(const BythosMessage* msg, uint8_t msg_id, uint8_t si
  * integridade dos campos TLV (bounds e tamanhos) e CRC16.
  * Alinhado com a implementação Rust validate_message().
  *
+ * Nota: o CRC16 é validado sobre o tamanho real da mensagem calculado
+ * a partir dos TLVs, NÃO sobre o tamanho do buffer fornecido. Isto
+ * permite que o buffer contenha dados adicionais sem afetar a validação.
+ *
  * @param buffer  Buffer contendo a mensagem
- * @param length  Tamanho do buffer
+ * @param length  Tamanho do buffer (mínimo BYTHOS_OVERHEAD)
  * @return        tlv_count se válido, 0xFF em erro
  */
 uint8_t bythos_validate(const uint8_t* buffer, size_t length) {
@@ -327,7 +340,7 @@ uint8_t bythos_validate(const uint8_t* buffer, size_t length) {
     uint8_t tlv_count = buffer[6];
     if (tlv_count > BYTHOS_MAX_TLV_FIELDS) return 0xFF;
 
-    // Percorrer campos TLV validando bounds
+    // Percorrer campos TLV validando bounds e calculando tamanho real
     size_t offset = BYTHOS_HEADER_SIZE;
     for (uint8_t i = 0; i < tlv_count; i++) {
         if (offset + BYTHOS_TLV_HEADER_SIZE > length) return 0xFF;
@@ -336,8 +349,13 @@ uint8_t bythos_validate(const uint8_t* buffer, size_t length) {
         offset += BYTHOS_TLV_HEADER_SIZE + field_len;
     }
 
-    // Validar CRC16 (últimos 2 bytes)
-    size_t crc_offset = length - BYTHOS_CRC16_SIZE;
+    // offset contém agora BYTHOS_HEADER_SIZE + soma dos TLVs
+    // Tamanho total da mensagem = offset + signature(1) + crc16(2)
+    size_t msg_size = offset + BYTHOS_SIGNATURE_SIZE + BYTHOS_CRC16_SIZE;
+    if (length < msg_size) return 0xFF;
+
+    // Validar CRC16 sobre o tamanho real da mensagem (não o buffer inteiro)
+    size_t crc_offset = msg_size - BYTHOS_CRC16_SIZE;
     uint16_t received_crc = (uint16_t)buffer[crc_offset] | ((uint16_t)buffer[crc_offset + 1] << 8);
     uint16_t computed_crc = bythos_calc_crc16(buffer, crc_offset);
     if (received_crc != computed_crc) return 0xFF;
@@ -347,20 +365,33 @@ uint8_t bythos_validate(const uint8_t* buffer, size_t length) {
 
 /**
  * Valida a assinatura de uma mensagem Bythos.
- * Primeiro valida CRC16 e estrutura, depois verifica a assinatura HMAC.
+ * Primeiro valida CRC16 e estrutura, depois verifica a assinatura XOR.
+ *
+ * Utiliza bythos_validate() para obter o tamanho real da mensagem
+ * antes de extrair o byte de assinatura, evitando problemas com
+ * buffers maiores que a mensagem.
  *
  * @param buffer         Buffer contendo a mensagem
- * @param length         Tamanho do buffer
+ * @param length         Tamanho do buffer (mínimo BYTHOS_OVERHEAD)
  * @param signature_key  Chave de assinatura
  * @return               1 se válida, 0 caso contrário
  */
 uint8_t bythos_validate_signature(const uint8_t* buffer, size_t length, uint8_t signature_key) {
     if (buffer == NULL || length < BYTHOS_OVERHEAD) return 0;
 
-    // Validar CRC primeiro
+    // Validar estrutura e CRC primeiro — se falhar, assinatura é irrelevante
     if (bythos_validate(buffer, length) == 0xFF) return 0;
 
-    size_t sig_offset = length - BYTHOS_CRC16_SIZE - BYTHOS_SIGNATURE_SIZE;
+    // Calcular tamanho real da mensagem a partir dos TLVs
+    uint8_t tlv_count = buffer[6];
+    size_t offset = BYTHOS_HEADER_SIZE;
+    for (uint8_t i = 0; i < tlv_count; i++) {
+        uint8_t field_len = buffer[offset + 1];
+        offset += BYTHOS_TLV_HEADER_SIZE + field_len;
+    }
+    // offset = BYTHOS_HEADER_SIZE + soma dos TLVs
+    size_t sig_offset = offset;  // Assinatura está logo após os TLVs
+
     uint8_t signature = buffer[sig_offset];
     uint8_t msg_id = buffer[3];
     uint8_t seq_lo = buffer[4];

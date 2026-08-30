@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # Módulo Protocolo Bythos
 //!
 //! Implementação completa do protocolo de comunicação binário Bythos v3.0.0.

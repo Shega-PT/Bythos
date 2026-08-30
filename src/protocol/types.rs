@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # Bythos — Tipos e Definições (v3.0.0)
 //!
 //! Este módulo define todas as constantes, enums e structs utilizados pelo
@@ -641,7 +643,9 @@ pub enum FieldImu {
 
 /// Identificadores de campos TLV para dados de voo.
 ///
-/// Faixa de IDs: 0x40-0x4F (tipo=1=f32, id=0x20-0x2F).
+/// Faixa de IDs: 0x40-0x43 para f32, 0xA2 para u16.
+/// LoopTime utiliza tipo u16 porque tempo de ciclo é tipicamente
+/// um valor inteiro em microssegundos, não um ponto flutuante.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFlight {
@@ -649,7 +653,9 @@ pub enum FieldFlight {
     AltBaro = 0x41,
     VSpeed = 0x42,
     Airspeed = 0x43,
-    LoopTime = 0x44,
+    /// Tempo de ciclo do loop em microssegundos (tipo u16, não f32).
+    /// FieldID = TYPE=5(u16) + ID=2 → 0xA2
+    LoopTime = 0xA2,
 }
 
 /// Identificadores de campos TLV para dados de energia.

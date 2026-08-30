@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # CRC-16/CCITT — Implementação Puro Rust
 //!
 //! Implementação do algoritmo CRC-16 utilizando o polinómio CCITT (0x1021).
@@ -238,8 +240,8 @@ mod tests {
     }
 
     #[test]
-    fn test_crc16_acp_header() {
-        // Simular CRC de uma mensagem ACP: start(0xAA) + version(0x03) + nodeId(0x06) + msgID(0x10)
+    fn test_crc16_bythos_header() {
+        // Simular CRC de uma mensagem Bythos: start(0xAA) + version(0x03) + nodeId(0x06) + msgID(0x10)
         let header = [0xAA, 0x03, 0x06, 0x10];
         let crc = calc_crc16(&header);
         // CRC não deve ser zero para estes dados específicos
@@ -249,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_crc16_message_consistency() {
-        // Construir uma mensagem ACP manualmente e verificar CRC
+        // Construir uma mensagem Bythos manualmente e verificar CRC
         let mut msg = [0u8; 20];
         msg[0] = 0xAA; // START
         msg[1] = 0x03; // VERSION

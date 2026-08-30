@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 fn main() {
     // Script de build para geração de bindings FFI (opcional)
     // Quando esp-idf-sys está habilitado, as bindings são geradas automaticamente

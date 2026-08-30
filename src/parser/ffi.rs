@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # FFI Parser — Funções extern "C" para Interoperação C/C++ (Bythos v3.0.0)
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -238,18 +240,21 @@ pub extern "C" fn bythos_parser_error_count(parser: *const Parser) -> u32 {
     parser.get_error_count()
 }
 
-/// Ativa ou desativa a saída de debug.
+/// Define a função de timestamp do parser.
+///
+/// Permite ao código C fornecer a sua própria fonte de tempo
+/// para deteção de timeout entre bytes.
 ///
 /// # Arguments
 /// * `parser` — Ponteiro para o parser.
-/// * `enable` — 1 para ativar, 0 para desativar.
+/// * `ts_fn` — Ponteiro para função `extern "C"` que retorna timestamp em microssegundos.
 #[no_mangle]
-pub extern "C" fn bythos_parser_set_debug(parser: *mut Parser, enable: u8) {
+pub extern "C" fn bythos_parser_set_timestamp_fn(parser: *mut Parser, ts_fn: TimestampFn) {
     if parser.is_null() {
         return;
     }
     let parser = unsafe { &mut *parser };
-    parser.set_debug(enable != 0);
+    parser.set_timestamp_fn(ts_fn);
 }
 
 /// Retorna a chave de assinatura do parser.

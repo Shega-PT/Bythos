@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # Bythos — Biblioteca Principal
 //!
 //! Esta crate implementa o protocolo de comunicação binário Bythos v3.0.0,

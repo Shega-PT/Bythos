@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # CRC-8/SMBUS — Implementação Puro Rust
 //!
 //! Implementação do algoritmo CRC-8 utilizando o polinómio SMBUS (0x07).

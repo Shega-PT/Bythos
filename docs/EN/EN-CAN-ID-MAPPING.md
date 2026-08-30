@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — CAN ID Mapping (29-bit Extended)
 
+Author: ShegaPT | License: GPL-3.0
+
 ## CAN ID Structure
 
 ```text

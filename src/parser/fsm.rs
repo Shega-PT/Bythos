@@ -1,8 +1,51 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # Parser FSM — Máquina de Estados Finita para Parsing de Mensagens Bythos v3.0.0
+//!
+//! Este módulo implementa um parser byte-a-byte para reconstruir mensagens
+//! Bythos a partir de um fluxo serial. A FSM garante validação em tempo real
+//! de cada byte recebido, com proteções contra timeout, overflow e corrupção.
 
 use crate::protocol::types::*;
 use crate::protocol::crc16::calc_crc16;
 use crate::protocol::codec::parse_tlv;
+
+/// Tipo da função de timestamp em microssegundos.
+///
+/// Utiliza ABI `extern "C"` para compatibilidade FFI com código C/C++.
+/// Permite injeção de diferentes fontes de tempo:
+/// - Em `std`: `SystemTime` (tempo real do sistema)
+/// - Em `no_std`/ESP32: hardware timer do microcontrolador
+/// - Em testes: função controlada para testes determinísticos
+///
+/// A função deve retornar o tempo atual em microssegundos desde um ponto
+/// de referência arbitrário. Apenas a diferença entre chamadas consecutivas
+/// é relevante para deteção de timeout.
+pub type TimestampFn = extern "C" fn() -> u64;
+
+/// Função de timestamp padrão — retorna o tempo real do sistema em `std`,
+/// ou 0 em `no_std` (timeout desativado).
+///
+/// Em `no_std`, o utilizador deve fornecer a sua própria função via
+/// `Parser::with_timestamp_fn()` ou `Parser::set_timestamp_fn()`.
+#[cfg(feature = "std")]
+extern "C" fn default_timestamp() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_micros() as u64,
+        Err(_) => 0,
+    }
+}
+
+/// Função de timestamp padrão para `no_std` — retorna 0 sempre.
+///
+/// O timeout é desativado por defeito em ambientes sem biblioteca padrão.
+/// O utilizador deve injetar a sua própria fonte de tempo via
+/// `Parser::with_timestamp_fn()` ou `Parser::set_timestamp_fn()`.
+#[cfg(not(feature = "std"))]
+extern "C" fn default_timestamp() -> u64 {
+    0
+}
 
 /// Estados da FSM do parser.
 #[repr(u8)]
@@ -60,6 +103,11 @@ pub enum ParserError {
 /// Reconstrói mensagens Bythos completas a partir de um fluxo de bytes
 /// recebidos serialmente. Utiliza uma FSM de 9 estados com proteções
 /// contra timeout, overflow e erros de integridade.
+///
+/// O timeout entre bytes é verificado automaticamente em cada chamada
+/// a `feed()`. Se o intervalo entre dois bytes consecutivos exceder
+/// `max_frame_gap_us`, o parser é resetado automaticamente e o erro
+/// `ErrTimeout` é retornado.
 pub struct Parser {
     /// Estado atual da FSM.
     state: ParserState,
@@ -83,22 +131,38 @@ pub struct Parser {
     error_count: u32,
     /// Último erro registado pelo parser.
     last_error: ParserError,
-    /// Indica se a saída de debug está habilitada.
-    debug: bool,
     /// Chave de assinatura (XOR key) para validação.
     signature_key: u8,
+    /// Função de timestamp para medir intervalos entre bytes.
+    /// Permite injeção de diferentes fontes de tempo (sistema, hardware, teste).
+    timestamp_fn: TimestampFn,
 }
 
 impl Parser {
-    /// Cria um novo parser FSM.
+    /// Cria um novo parser FSM com a fonte de timestamp padrão.
     ///
-    /// O parser é inicializado no estado `WaitStart` pronto para
-    /// receber bytes de uma nova mensagem.
+    /// Em `std`, utiliza `SystemTime` para obter o timestamp real.
+    /// Em `no_std`, o timeout é desativado (retorna 0 sempre).
+    /// Para personalizar a fonte de tempo, usar `with_timestamp_fn()`.
     ///
     /// # Arguments
     ///
     /// * `key` — Chave de assinatura (XOR key) para validação de mensagens.
     pub fn new(key: u8) -> Self {
+        Self::with_timestamp_fn(key, default_timestamp)
+    }
+
+    /// Cria um novo parser FSM com uma função de timestamp personalizada.
+    ///
+    /// Permite ao utilizador fornecer a sua própria fonte de tempo,
+    /// útil para testes determinísticos ou ambientes embedded com
+    /// hardware timers específicos.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` — Chave de assinatura (XOR key) para validação de mensagens.
+    /// * `ts_fn` — Função `extern "C"` que retorna o timestamp em microssegundos.
+    pub fn with_timestamp_fn(key: u8, ts_fn: TimestampFn) -> Self {
         Self {
             state: ParserState::WaitStart,
             raw_buffer: [0u8; MAX_MESSAGE_SIZE],
@@ -111,8 +175,8 @@ impl Parser {
             success_count: 0,
             error_count: 0,
             last_error: ParserError::Ok,
-            debug: false,
             signature_key: key,
+            timestamp_fn: ts_fn,
         }
     }
 
@@ -131,8 +195,24 @@ impl Parser {
     /// `ParserError::Ok` se o byte foi processado com sucesso,
     /// ou um código de erro específico.
     pub fn feed(&mut self, byte: u8) -> ParserError {
+        // Verificar timeout entre bytes — se exceder o gap máximo,
+        // resetar o parser e reportar erro. Apenas verificamos se já
+        // estamos a processar uma mensagem (não em WaitStart).
+        if self.state != ParserState::WaitStart {
+            let now = (self.timestamp_fn)();
+            let elapsed = now.wrapping_sub(self.last_byte_time_us);
+            if elapsed > self.max_frame_gap_us as u64 {
+                self.last_error = ParserError::ErrTimeout;
+                self.error_count += 1;
+                self.state = ParserState::WaitStart;
+                self.raw_offset = 0;
+                self.tlv_data_remaining = 0;
+                return ParserError::ErrTimeout;
+            }
+        }
+
         // Atualizar timestamp do último byte
-        self.last_byte_time_us = self.get_timestamp_us();
+        self.last_byte_time_us = (self.timestamp_fn)();
 
         match self.state {
             // ====================================================================
@@ -440,11 +520,14 @@ impl Parser {
     }
 
     /// Verifica se o parser excedeu o timeout entre bytes.
+    ///
+    /// Retorna `true` se o intervalo entre o último byte recebido
+    /// e o momento atual exceder `max_frame_gap_us`.
     pub fn is_timed_out(&self) -> bool {
         if self.state == ParserState::WaitStart {
             return false;
         }
-        let now = self.get_timestamp_us();
+        let now = (self.timestamp_fn)();
         let elapsed = now.wrapping_sub(self.last_byte_time_us);
         elapsed > self.max_frame_gap_us as u64
     }
@@ -469,11 +552,6 @@ impl Parser {
         self.error_count
     }
 
-    /// Ativa ou desativa a saída de debug.
-    pub fn set_debug(&mut self, enable: bool) {
-        self.debug = enable;
-    }
-
     /// Retorna a chave de assinatura configurada.
     pub fn get_key(&self) -> u8 {
         self.signature_key
@@ -484,23 +562,16 @@ impl Parser {
         self.signature_key = key;
     }
 
-    /// Obtém o timestamp atual em microssegundos.
+    /// Define a função de timestamp utilizada pelo parser.
     ///
-    /// Em ambientes std, retorna o tempo real desde o epoch.
-    /// Em ambientes no_std, retorna 0 (timeout desativado).
-    fn get_timestamp_us(&self) -> u64 {
-        #[cfg(feature = "std")]
-        {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(d) => d.as_micros() as u64,
-                Err(_) => 0,
-            }
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            0
-        }
+    /// Permite alterar a fonte de tempo após a criação do parser.
+    /// Útil para alternar entre timers ou desativar o timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `ts_fn` — Nova função de timestamp em microssegundos.
+    pub fn set_timestamp_fn(&mut self, ts_fn: TimestampFn) {
+        self.timestamp_fn = ts_fn;
     }
 }
 
@@ -806,5 +877,79 @@ mod tests {
         assert_eq!(field_id, 0x10);
 
         parser.acknowledge();
+    }
+
+    // ========================================================================
+    // TESTES — TIMEOUT
+    // ========================================================================
+
+    /// Contador global para testes de timestamp controlado.
+    /// Cada chamada avança o relógio em 1000 microssegundos.
+    static mut TEST_COUNTER: u64 = 0;
+
+    /// Função de timestamp mock para testes — avança 1ms por chamada.
+    extern "C" fn mock_timestamp() -> u64 {
+        unsafe {
+            TEST_COUNTER += 1000;
+            TEST_COUNTER
+        }
+    }
+
+    /// Reset do contador de teste entre testes.
+    fn reset_test_counter() {
+        unsafe { TEST_COUNTER = 0; }
+    }
+
+    #[test]
+    fn test_parser_timeout_detection() {
+        reset_test_counter();
+        let mut parser = Parser::with_timestamp_fn(0x42, mock_timestamp);
+        parser.set_max_frame_gap(5000); // 5ms timeout
+
+        // Alimentar START_BYTE — estado passa para WaitHeader
+        let result = parser.feed(START_BYTE);
+        assert_eq!(result, ParserError::Ok);
+        assert_eq!(parser.get_current_state(), ParserState::WaitHeader);
+
+        // Alimentar bytes suficientes para avançar para WaitHeader completo
+        // O parser aguarda 5 bytes após START: ver, node, msg, seqLo, seqHi
+        // Cada feed() consome 1ms do mock, mas o timeout é 5ms
+        let result = parser.feed(BYTHOS_VERSION);
+        assert_eq!(result, ParserError::Ok);
+
+        // O timestamp_mock avança 1ms por feed, mas o timeout é 5ms
+        // Portanto não deve haver timeout entre bytes normais
+        assert_ne!(parser.get_current_state(), ParserState::WaitStart);
+    }
+
+    #[test]
+    fn test_parser_timeout_triggers_reset() {
+        reset_test_counter();
+        let mut parser = Parser::with_timestamp_fn(0x42, mock_timestamp);
+        parser.set_max_frame_gap(2); // 2μs timeout — muito curto
+
+        // Feed START_BYTE — primeiro byte não verifica timeout (WaitStart)
+        let result = parser.feed(START_BYTE);
+        assert_eq!(result, ParserError::Ok);
+        assert_eq!(parser.get_current_state(), ParserState::WaitHeader);
+
+        // Próximo feed chama mock_timestamp que avança 1000μs > 2μs
+        // Deve detectar timeout e resetar
+        let result = parser.feed(BYTHOS_VERSION);
+        assert_eq!(result, ParserError::ErrTimeout);
+        assert_eq!(parser.get_current_state(), ParserState::WaitStart);
+        assert!(parser.get_error_count() > 0);
+    }
+
+    #[test]
+    fn test_parser_timeout_no_check_in_wait_start() {
+        reset_test_counter();
+        let mut parser = Parser::with_timestamp_fn(0x42, mock_timestamp);
+        parser.set_max_frame_gap(0); // Timeout zero
+
+        // Em WaitStart, o timeout NÃO é verificado
+        let result = parser.feed(0x00); // byte inválido
+        assert_eq!(result, ParserError::ErrStart);
+        // Não deve retornar ErrTimeout mesmo com timeout=0
     }
 }

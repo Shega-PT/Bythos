@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — Guia do Builder
 
+Autor: ShegaPT | Licença: GPL-3.0
+
 ## Visão Geral
 
 O `TLVBuilder` é um construtor fluente para mensagens Bythos v3.0.0. Permite construir mensagens de forma segura e eficiente, adicionando campos um a um e serializando a mensagem completa no final.
@@ -10,7 +12,6 @@ O `TLVBuilder` é um construtor fluente para mensagens Bythos v3.0.0. Permite co
 
 ```rust
 use bythos::protocol::builder::TLVBuilder;
-use bythos::protocol::types::FieldType;
 
 // Criar builder com node_id=0x06, signature_key=0x42
 let mut builder = TLVBuilder::new(0x06, 0x42);
@@ -18,12 +19,12 @@ let mut builder = TLVBuilder::new(0x06, 0x42);
 // Configurar número de sequência
 builder.set_seq(1);
 
-// Adicionar campos TLV
-builder.add_u8_field(0xC0, 2).unwrap();          // SystemState = Ready
-builder.add_f32_field(0x26, -33.8999).unwrap();  // GPS Latitude
-builder.add_f32_field(0x27, 151.2093).unwrap();  // GPS Longitude
-builder.add_f32_field(0x30, 1.5).unwrap();       // IMU Roll
-builder.add_u32_field(0x82, 3600).unwrap();      // SystemUptime
+// Adicionar campos TLV (field_id é o ID lógico 0-31; o tipo é codificado automaticamente)
+builder.add_u8_field(0, 2).unwrap();          // SystemState = Ready (ID=0, tipo=6(u8) → 0xC0)
+builder.add_f32_field(6, -33.8999).unwrap();  // GPS Latitude (ID=6, tipo=1(f32) → 0x26)
+builder.add_f32_field(7, 151.2093).unwrap();  // GPS Longitude (ID=7, tipo=1(f32) → 0x27)
+builder.add_f32_field(16, 1.5).unwrap();      // IMU Roll (ID=16, tipo=1(f32) → 0x30)
+builder.add_u32_field(2, 3600).unwrap();      // SystemUptime (ID=2, tipo=4(u32) → 0x82)
 
 // Serializar para buffer
 let mut buffer = [0u8; 1098];
@@ -66,29 +67,29 @@ let size = builder.build(0x11, &mut buffer).unwrap();
 
 | Método                          | Descrição                              |
 |---------------------------------|----------------------------------------|
-| `field_count()`                 | Número de campos adicionados           |
+| `get_tlv_count()`                | Número de campos adicionados           |
 
 ---
 
 ## Uso via FFI (C/C++)
 
 ```c
-#include "protocol_ffi.h"
+#include "bythos.h"
 
-TLVMessage msg;
-bythos_init(&msg, 0x06, 0x42);
+BythosMessage msg;
+bythos_init(&msg, 0x06, 0x11);  // node_id=0x06, msg_id=0x11 (Telemetry)
 
 // Adicionar campos
-bythos_add_tlv_uint8(&msg, 0xC0, 2);
-bythos_add_tlv_float(&msg, 0x26, -33.8999f);
-bythos_add_tlv_float(&msg, 0x27, 151.2093f);
+bythos_tlv_add_u8(&msg, 0xC0, 2);
+bythos_tlv_add_f32(&msg, 0x26, -33.8999f);
+bythos_tlv_add_f32(&msg, 0x27, 151.2093f);
 
 // Definir sequência
 bythos_set_seq(&msg, 1);
 
 // Serializar
 uint8_t buffer[1098];
-ssize_t size = bythos_build_message(&msg, 0x11, buffer, sizeof(buffer));
+bythos_ssize_t size = bythos_build(&msg, 0x11, 0x42, buffer, sizeof(buffer));
 ```
 
 ---

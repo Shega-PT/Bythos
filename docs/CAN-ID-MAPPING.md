@@ -1,5 +1,7 @@
 # Bythos v3.0.0 — Mapeamento CAN ID Extended (29-bit)
 
+Autor: ShegaPT | Licença: GPL-3.0
+
 ## Estrutura do CAN ID
 
 ```text

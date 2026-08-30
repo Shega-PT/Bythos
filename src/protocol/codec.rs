@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # Codec Bythos — Serialização, Validação e Parsing (v3.0.0)
 //!
 //! Este módulo implementa as operações fundamentais de serialização,
@@ -66,17 +68,19 @@ pub fn build_tlv(id: u8, data: &[u8], output: &mut [u8]) -> Result<usize, Protoc
 
 /// Serializa um campo TLV de vídeo em bytes.
 ///
-/// Utiliza `MAX_TLV_VIDEO_DATA` (128 bytes) em vez de `MAX_TLV_DATA` (32 bytes).
+/// Utiliza `MAX_TLV_VIDEO_DATA` (128 bytes) em vez de `MAX_TLV_DATA` (32 bytes)
+/// para acomodar payloads de vídeo maiores.
 ///
 /// # Arguments
 ///
+/// * `id` — FieldID codificado do campo de vídeo.
 /// * `data` — Dados do campo de vídeo.
 /// * `output` — Buffer de saída.
 ///
 /// # Returns
 ///
 /// `Ok(bytes_written)` em sucesso, `Err(ProtocolError)` em caso de erro.
-pub fn build_tlv_video(data: &[u8], output: &mut [u8]) -> Result<usize, ProtocolError> {
+pub fn build_tlv_video(id: u8, data: &[u8], output: &mut [u8]) -> Result<usize, ProtocolError> {
     let data_len = data.len().min(MAX_TLV_VIDEO_DATA);
     let required_size = TLV_HEADER_SIZE + data_len;
 
@@ -84,7 +88,7 @@ pub fn build_tlv_video(data: &[u8], output: &mut [u8]) -> Result<usize, Protocol
         return Err(ProtocolError::BufferTooSmall);
     }
 
-    output[0] = FieldVideo::Payload as u8;
+    output[0] = id;
     output[1] = data_len as u8;
     output[TLV_HEADER_SIZE..TLV_HEADER_SIZE + data_len]
         .copy_from_slice(&data[..data_len]);
@@ -441,11 +445,17 @@ mod tests {
     fn test_build_tlv_video() {
         let data = [0xAA, 0xBB, 0xCC];
         let mut output = [0u8; 200];
-        let size = build_tlv_video(&data, &mut output).unwrap();
 
-        assert_eq!(output[0], FieldVideo::Payload as u8);  // id
-        assert_eq!(output[1], 3);                            // len
+        // Teste com Payload (o id é agora respeitado)
+        let size = build_tlv_video(FieldVideo::Payload as u8, &data, &mut output).unwrap();
+        assert_eq!(output[0], FieldVideo::Payload as u8);
+        assert_eq!(output[1], 3);
         assert_eq!(size, 5);
+
+        // Teste com outro FieldID de vídeo (FrameId)
+        let size2 = build_tlv_video(FieldVideo::FrameId as u8, &data, &mut output).unwrap();
+        assert_eq!(output[0], FieldVideo::FrameId as u8);
+        assert_eq!(size2, 5);
     }
 
     #[test]

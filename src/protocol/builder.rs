@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! # TLVBuilder — Construtor de Mensagens Bythos v3.0.0
 //!
 //! Implementação do construtor fluent para mensagens Bythos v3.0.0.
