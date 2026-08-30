@@ -1,36 +1,33 @@
 /**
  * =================================================================================
- * PROTOCOL.CPP — IMPLEMENTAÇÃO DO Bythos Protocol V1
+ * PROTOCOL.CPP — IMPLEMENTAÇÃO DO PROTOCOLO TLV v2.0.0
  * =================================================================================
- *
+ * 
  * AUTOR:      ShegaPT
  * DATA:       2026-04-17
- * VERSÃO:     1.0.0
- *
+ * VERSÃO:     2.0.0
+ * 
  * =================================================================================
  * DESCRIÇÃO
  * =================================================================================
- *
- * Implementação das funções de serialização, desserialização e validação
- * do Bythos Protocol V1. Este módulo fornece as operações
- * fundamentais de construção e verificação de mensagens transmitidas
- * exclusivamente via UART.
- *
+ * 
+ * Implementação das funções de serialização, desserialização, validação CRC8
+ * e manipulação de campos TLV para o protocolo Bythos Protocol V2.
+ * 
  * =================================================================================
- * ARQUITETURA DE IMPLEMENTAÇÃO
+ * NOTAS DE IMPLEMENTAÇÃO
  * =================================================================================
- *
- * 1. CRC8/SMBUS: Tabela de lookup estática de 256 entradas para O(1) por byte.
- *    Polinómio 0x07 — amplamente utilizado em protocolos industriais (I2C, SMBus).
- *    Garante deteção de todos os erros de 1-2 bits e rajadas até 8 bits.
- *
- * 2. Serialização: Campo a campo, SEM memcpy() em structs inteiras.
- *    Isto elimina problemas de padding do compilador e alinhamento em memória,
- *    garantindo que o formato binário no canal é idêntico em qualquer plataforma.
- *
- * 3. Validação: Múltiplas camadas de verificação — estrutura, limites e CRC.
- *    Fail-secure: qualquer invalidade resulta em rejeição imediata da mensagem.
- *
+ * 
+ * 1. CRC8: Utiliza tabela de lookup para máxima velocidade (O(1) por byte).
+ *         Polinómio 0x07 (CRC-8/SMBUS) — usado em I2C e muitos protocolos.
+ * 
+ * 2. Serialização: Campo a campo, SEM usar memcpy() em structs inteiras
+ *    para evitar problemas de padding e alinhamento.
+ * 
+ * 3. Debug: Compilação condicional — desativar definindo NDEBUG ou removendo
+ *    a macro PROTOCOL_DEBUG. Em produção, manter ativo pois apenas imprime
+ *    para Serial/console, nunca interfere no canal de comunicação.
+ * 
  * =================================================================================
  */
 
@@ -41,10 +38,9 @@
 /* =================================================================================
  * DEBUG CONFIGURÁVEL
  * =================================================================================
- *
- * O prefixo "[Protocol]" permite filtragem no monitor série.
- * Em produção, manter PROTOCOL_DEBUG ativo é seguro — apenas imprime
- * para Serial/consola e nunca interfere no canal de comunicação.
+ * 
+ * Define PROTOCOL_DEBUG para ativar mensagens de diagnóstico.
+ * O prefixo "[Protocol]" permite filtrar no monitor série.
  */
 
 #define PROTOCOL_DEBUG
@@ -62,20 +58,17 @@
 #endif
 
 /* =================================================================================
- * TABELA CRC8 — POLINÓMIO 0x07 (CRC-8/SMBUS)
+ * TABELA CRC8 (POLINÓMIO 0x07 — CRC-8/SMBUS)
  * =================================================================================
- *
+ * 
  * Polinómio: x^8 + x^2 + x^1 + x^0 = 0x07
- *
- * A tabela de 256 entradas é pré-calculada e embutida em ROM.
- * Cada entrada corresponde ao resultado do CRC para o valor de um byte
- * quando processado sequencialmente. Isto permite calcular o CRC de
- * qualquer stream comcomplexidade O(n) onde n = número de bytes.
- *
- * O CRC-8/SMBUS é escolhido por:
- *   • Simplicidade de implementação (1 byte de output)
- *   • Boa deteção de erros para tramas curtas (<256 bytes)
- *   • Amplamente suportado em hardware e software
+ * 
+ * Porque usar tabela?
+ *   - Velocidade: O(1) por byte vs O(8) por byte do cálculo bit-a-bit
+ *   - Simplicidade: 256 bytes de ROM são insignificantes no ESP32
+ *   - Deteção de erros: Detecta todos os erros de 1-2 bits, rajadas ≤8 bits
+ * 
+ * A tabela foi pré-calculada e está embutida em ROM para máxima performance.
  */
 
 static const uint8_t CRC8_TABLE[256] = {
@@ -100,400 +93,409 @@ static const uint8_t CRC8_TABLE[256] = {
 /* =================================================================================
  * calcCRC8 — CÁLCULO DE CRC8 COM TABELA DE LOOKUP
  * =================================================================================
- *
- * Algoritmo estándar CRC-8/SMBUS:
- *   1. Inicializar registo CRC com 0x00 (valor inicial do SMBUS)
- *   2. Para cada byte do buffer: CRC = TABELA[CRC XOR byte]
+ * 
+ * Algoritmo:
+ *   1. Inicializar CRC com 0x00
+ *   2. Para cada byte: CRC = TABELA[CRC XOR byte]
  *   3. Retornar CRC final
- *
- * Complexidade temporal: O(n) onde n = len
- * Complexidade espacial: O(1) — tabela estática em ROM
- *
- * @param data  Ponteiro para os dados a processar
- * @param len   Número de bytes a incluir no cálculo
- * @return      CRC8 calculado (intervalo 0x00-0xFF)
+ * 
+ * Complexidade: O(n) onde n é o número de bytes
+ * 
+ * @param data  Ponteiro para os dados
+ * @param len   Número de bytes
+ * @return      CRC8 calculado
  */
 
 uint8_t calcCRC8(const uint8_t* data, size_t len) {
-    /* Valor inicial do CRC-8/SMBUS é sempre 0x00 */
-    uint8_t crc = 0x00;
-
-    /* Processar cada byte sequencialmente via tabela de lookup */
+    uint8_t crc = 0x00;  /* Valor inicial do CRC-8/SMBUS é 0x00 */
+    
     for (size_t i = 0; i < len; i++) {
         crc = CRC8_TABLE[crc ^ data[i]];
     }
-
+    
     return crc;
 }
 
 /* =================================================================================
- * buildTLV — SERIALIZAÇÃO DE UM CAMPO TLV INDIVIDUAL
+ * buildTLV — SERIALIZA UM CAMPO TLV INDIVIDUAL
  * =================================================================================
- *
- * Serializa um campo TLV para um buffer de saída no formato compacto:
+ * 
+ * Formato de saída:
  *   [ID (1 byte)] [LEN (1 byte)] [DATA (LEN bytes)]
- *
- * Validações internas:
- *   • output não pode ser NULL
- *   • data não pode ser NULL quando len > 0
- *   • len é truncado silenciosamente para MAX_TLV_DATA se excedido
- *
- * @param id     Identificador do campo (ex: FLD_DATA_0)
+ * 
+ * @param id     Identificador do campo (ex: FLD_ROLL)
  * @param data   Ponteiro para os dados a serializar
- * @param len    Número de bytes dos dados (máx MAX_TLV_DATA = 16)
- * @param output Buffer de saída (mínimo len+2 bytes)
- * @return       Número de bytes escritos (0 em caso de erro)
+ * @param len    Número de bytes dos dados (máx MAX_TLV_DATA)
+ * @param output Buffer de saída (deve ter pelo menos len + 2 bytes)
+ * @return       Número de bytes escritos (0 = erro)
  */
 
 size_t buildTLV(uint8_t id, const uint8_t* data, uint8_t len, uint8_t* output) {
-    /* Validar ponteiro de saída — retorno imediato se inválido */
+    /* Validação de parâmetros — segurança em primeiro lugar */
     if (output == nullptr) {
         DEBUG_PRINT("ERRO: buildTLV — output é NULL\n");
         return 0;
     }
-
-    /* Validar coerência entre ponteiro e comprimento */
+    
     if (data == nullptr && len > 0) {
         DEBUG_PRINT("ERRO: buildTLV — data é NULL mas len=%d\n", len);
         return 0;
     }
-
+    
     /* Truncamento silencioso para evitar buffer overflow */
     if (len > MAX_TLV_DATA) {
-        DEBUG_PRINT("AVISO: buildTLV id=0x%02X len=%d > MAX=%d → truncado\n",
+        DEBUG_PRINT("AVISO: buildTLV id=0x%02X len=%d > MAX=%d → truncado\n", 
                     id, len, MAX_TLV_DATA);
         len = MAX_TLV_DATA;
     }
-
-    /* Serialização compacta: ID + LEN + DATA */
+    
+    /* Serialização compacta */
     output[0] = id;
     output[1] = len;
-
+    
     if (len > 0) {
         memcpy(&output[2], data, len);
     }
-
-    return (size_t)(len + 2);  /* Retornar total: ID + LEN + DATA */
+    
+    return (size_t)(len + 2);  /* ID + LEN + DATA */
 }
 
 /* =================================================================================
- * buildMessage — SERIALIZAÇÃO DE UMA MENSAGEM TLV COMPLETA
+ * buildTLVVideo — SERIALIZA UM CAMPO TLV DE VÍDEO
  * =================================================================================
- *
- * Monta uma trama completa pronta para transmissão via UART:
- *   [START_BYTE (0xAA)] [MSGID] [TLV_COUNT] [TLV0] [TLV1]...[TLVn] [CRC8]
- *
- * O CRC8 é calculado sobre TODOS os bytes anteriores ao CRC (START até
- * ao último byte do último TLV), garantindo verificação de integridade.
- *
- * Validações:
- *   • buffer e msg não podem ser NULL
- *   • bufferSize deve ser >= MIN_MESSAGE_SIZE (4 bytes)
- *   • tlvCount é limitado a MAX_TLV_FIELDS
- *   • Cada TLV é verificado individualmente contra overflow
- *
- * @param msg        Ponteiro para a mensagem estruturada em memória
- * @param msgID      ID da mensagem (sobrescreve msg->msgID se != 0)
- * @param buffer     Buffer de saída para a trama serializada
- * @param bufferSize Capacidade total do buffer de saída
+ * 
+ * Específico para payloads maiores (até MAX_TLV_VIDEO_DATA = 128 bytes)
+ * Usa o ID fixo FLD_VIDEO_PAYLOAD (0xB3)
+ * 
+ * @param data   Ponteiro para os dados de vídeo
+ * @param len    Comprimento do chunk (máx MAX_TLV_VIDEO_DATA)
+ * @param output Buffer de saída
+ * @return       Número de bytes escritos
+ */
+
+size_t buildTLVVideo(const uint8_t* data, uint8_t len, uint8_t* output) {
+    if (output == nullptr) {
+        DEBUG_PRINT("ERRO: buildTLVVideo — output é NULL\n");
+        return 0;
+    }
+    
+    if (len > MAX_TLV_VIDEO_DATA) {
+        DEBUG_PRINT("AVISO: buildTLVVideo len=%d > MAX=%d → truncado\n", 
+                    len, MAX_TLV_VIDEO_DATA);
+        len = MAX_TLV_VIDEO_DATA;
+    }
+    
+    output[0] = FLD_VIDEO_PAYLOAD;  /* ID fixo para payload de vídeo */
+    output[1] = len;
+    
+    if (len > 0) {
+        memcpy(&output[2], data, len);
+    }
+    
+    return (size_t)(len + 2);
+}
+
+/* =================================================================================
+ * buildMessage — SERIALIZA UMA MENSAGEM TLV COMPLETA
+ * =================================================================================
+ * 
+ * Formato de saída:
+ *   [START_BYTE][MSGID][TLV_COUNT][TLV0][TLV1]...[TLVn][CRC8]
+ * 
+ * O CRC8 é calculado sobre TODO o conteúdo (START_BYTE até ao último byte
+ * do último TLV), excluindo o próprio byte de CRC.
+ * 
+ * @param msg        Ponteiro para a mensagem estruturada
+ * @param msgID      ID da mensagem (sobrescreve msg->msgID se !=0)
+ * @param buffer     Buffer de saída
+ * @param bufferSize Tamanho do buffer (deve ser >= MIN_MESSAGE_SIZE)
  * @return           Número de bytes escritos (0 = erro)
  */
 
 size_t buildMessage(TLVMessage* msg, uint8_t msgID, uint8_t* buffer, size_t bufferSize) {
-    /* ================================================================
-     * FASE 1: VALIDAÇÃO DE PARÂMETROS DE ENTRADA
-     * ================================================================
-     * Verificar todos os ponteiros e limites antes de qualquer escrita.
-     * Qualquer invalidade resulta em retorno imediato de 0.
-     */
+    /* Validações iniciais */
     if (buffer == nullptr) {
         DEBUG_PRINT("ERRO: buildMessage — buffer é NULL\n");
         return 0;
     }
-
+    
     if (msg == nullptr) {
         DEBUG_PRINT("ERRO: buildMessage — msg é NULL\n");
         return 0;
     }
-
+    
     if (bufferSize < MIN_MESSAGE_SIZE) {
-        DEBUG_PRINT("ERRO: buildMessage — buffer demasiado pequeno (%zu < %d)\n",
+        DEBUG_PRINT("ERRO: buildMessage — buffer demasiado pequeno (%zu < %d)\n", 
                     bufferSize, MIN_MESSAGE_SIZE);
         return 0;
     }
-
-    /* ================================================================
-     * FASE 2: NORMALIZAÇÃO DO NÚMERO DE TLVs
-     * ================================================================
-     * Garantir que o número de campos não excede o máximo permitido.
-     * Se exceder, é truncado silenciosamente com aviso.
-     */
+    
+    /* Garantir que o número de TLVs não excede o máximo */
     if (msg->tlvCount > MAX_TLV_FIELDS) {
-        DEBUG_PRINT("AVISO: buildMessage tlvCount=%d > MAX=%d → truncado\n",
+        DEBUG_PRINT("AVISO: buildMessage tlvCount=%d > MAX=%d → truncado\n", 
                     msg->tlvCount, MAX_TLV_FIELDS);
         msg->tlvCount = MAX_TLV_FIELDS;
     }
-
-    /* ================================================================
-     * FASE 3: ESCRITA DO CABEÇALHO (3 bytes)
-     * ================================================================
-     * Os três primeiros bytes são固定: START_BYTE, MSGID, TLV_COUNT.
-     */
+    
+    /* Escrever cabeçalho */
     buffer[0] = START_BYTE;
     buffer[1] = msgID;
     buffer[2] = msg->tlvCount;
-
+    
     size_t offset = 3;  /* Próxima posição livre no buffer */
-
-    /* ================================================================
-     * FASE 4: SERIALIZAÇÃO SEQUENCIAL DOS TLVs
-     * ================================================================
-     * Cada campo TLV é serializado individualmente via buildTLV().
-     * É verificado espaço suficiente antes de cada escrita.
-     */
+    
+    /* Serializar cada campo TLV */
     for (size_t i = 0; i < msg->tlvCount; i++) {
-        /* Verificar espaço para ID + LEN + payload do TLV atual */
+        /* Verificar espaço suficiente para ID + LEN + DATA */
         if (offset + 2 + msg->tlvs[i].len > bufferSize - 1) {
             DEBUG_PRINT("ERRO: buildMessage — buffer overflow no TLV %zu\n", i);
             return 0;
         }
-
-        size_t written = buildTLV(msg->tlvs[i].id,
-                                   msg->tlvs[i].data,
-                                   msg->tlvs[i].len,
+        
+        size_t written = buildTLV(msg->tlvs[i].id, 
+                                   msg->tlvs[i].data, 
+                                   msg->tlvs[i].len, 
                                    &buffer[offset]);
-
+        
         if (written == 0) {
             DEBUG_PRINT("ERRO: buildMessage — buildTLV falhou para TLV %zu\n", i);
             return 0;
         }
-
+        
         offset += written;
     }
-
-    /* ================================================================
-     * FASE 5: CÁLCULO E ESCRITA DO CRC8
-     * ================================================================
-     * O CRC é calculado sobre todo o conteúdo já escrito (START até
-     * ao último byte do último TLV) e escrito na posição seguinte.
-     */
+    
+    /* Verificar espaço para o CRC8 */
     if (offset + 1 > bufferSize) {
         DEBUG_PRINT("ERRO: buildMessage — sem espaço para CRC8\n");
         return 0;
     }
-
+    
+    /* Calcular e escrever CRC8 sobre todo o conteúdo */
     buffer[offset] = calcCRC8(buffer, offset);
     offset++;
-
-    DEBUG_PRINT("buildMessage: msgID=0x%02X, %d TLVs, tamanho=%zu bytes\n",
+    
+    DEBUG_PRINT("buildMessage: msgID=0x%02X, %d TLVs, tamanho=%zu bytes\n", 
                 msgID, msg->tlvCount, offset);
-
+    
     return offset;
 }
 
 /* =================================================================================
- * validateMessage — VALIDAÇÃO ESTRUTURAL E DE INTEGRIDADE
+ * validateMessage — VALIDA UMA MENSAGEM RECEBIDA
  * =================================================================================
- *
- * Valida uma mensagem recebida verificando múltiplas camadas:
- *
- *   CAMADA 1 — Parâmetros básicos:
- *     • Buffer não é NULL
- *     • Comprimento >= MIN_MESSAGE_SIZE (4 bytes)
- *
- *   CAMADA 2 — Sincronização:
- *     • Primeiro byte deve ser START_BYTE (0xAA)
- *
- *   CAMADA 3 — Cabeçalho:
- *     • msgID deve estar no intervalo válido (0x10-0x15)
- *     • tlvCount não pode exceder MAX_TLV_FIELDS (8)
- *
- *   CAMADA 4 — Estrutura TLV:
- *     • Cada TLV tem pelo menos 2 bytes (ID + LEN)
- *     • Payload de cada TLV não excede o buffer restante
- *
- *   CAMADA 5 — Integridade:
- *     • CRC8 calculado corresponde ao CRC8 recebido
- *
- * Esta validação NÃO verifica autenticação (HMAC) nem sequência
- * anti-replay. A integridade depende exclusivamente do CRC8.
- *
- * @param buffer Buffer contendo a mensagem recebida
- * @param length Comprimento efetivo do buffer
- * @return       1 = mensagem válida, 0 = inválida
+ * 
+ * Verificações realizadas:
+ *   1. START_BYTE correto (0xAA)
+ *   2. msgID válido (0x10-0x18)
+ *   3. tlvCount dentro dos limites (≤ MAX_TLV_FIELDS)
+ *   4. Estrutura dos TLVs (sem truncamentos)
+ *   5. CRC8 correspondente
+ * 
+ * NOTA: Esta função NÃO verifica HMAC ou sequência anti-replay.
+ *       Essas validações são responsabilidade do módulo Security.
+ * 
+ * @param buffer Buffer com a mensagem recebida
+ * @param length Comprimento do buffer
+ * @return       1 = válida, 0 = inválida
  */
 
 uint8_t validateMessage(const uint8_t* buffer, size_t length) {
-    /* ================================================================
-     * CAMADA 1: VALIDAÇÃO DE PARÂMETROS BÁSICOS
-     * ================================================================ */
+    /* Validação básica de parâmetros */
     if (buffer == nullptr) {
         DEBUG_PRINT("ERRO: validateMessage — buffer é NULL\n");
         return 0;
     }
-
+    
     if (length < MIN_MESSAGE_SIZE) {
-        DEBUG_PRINT("ERRO: validateMessage — buffer demasiado curto (%zu < %d)\n",
+        DEBUG_PRINT("ERRO: validateMessage — buffer demasiado curto (%zu < %d)\n", 
                     length, MIN_MESSAGE_SIZE);
         return 0;
     }
-
-    /* ================================================================
-     * CAMADA 2: VERIFICAÇÃO DE SINCRONIZAÇÃO
-     * ================================================================
-     * O primeiro byte deve ser sempre 0xAA (START_BYTE).
-     * Se não for, a mensagem é descartada imediatamente.
-     */
+    
+    /* 1. Verificar START_BYTE */
     if (buffer[0] != START_BYTE) {
         DEBUG_PRINT("ERRO: validateMessage — START_BYTE inválido (0x%02X != 0xAA)\n", buffer[0]);
         return 0;
     }
-
-    /* ================================================================
-     * CAMADA 3: VALIDAÇÃO DO CABEÇALHO
-     * ================================================================
-     * Verificar msgID e tlvCount contra os limites definidos.
-     */
+    
+    /* 2. Verificar msgID */
     uint8_t msgID = buffer[1];
     if (!isValidMsgID(msgID)) {
         DEBUG_PRINT("ERRO: validateMessage — msgID desconhecido (0x%02X)\n", msgID);
         return 0;
     }
-
+    
+    /* 3. Verificar tlvCount */
     uint8_t tlvCount = buffer[2];
     if (tlvCount > MAX_TLV_FIELDS) {
-        DEBUG_PRINT("ERRO: validateMessage — tlvCount (%d) > MAX_TLV_FIELDS (%d)\n",
+        DEBUG_PRINT("ERRO: validateMessage — tlvCount (%d) > MAX_TLV_FIELDS (%d)\n", 
                     tlvCount, MAX_TLV_FIELDS);
         return 0;
     }
-
-    /* ================================================================
-     * CAMADA 4: VALIDAÇÃO DA ESTRUTURA TLV
-     * ================================================================
-     * Percorrer sequencialmente todos os TLVs verificando:
-     *   • Existem pelo menos 2 bytes (ID + LEN)
-     *   • O payload cabe no buffer restante
-     *   • O LEN não excede o máximo permitido
-     */
-    size_t offset = 3;  /* Posição inicial: após START + MSGID + COUNT */
-
+    
+    /* 4. Percorrer TLVs para validar estrutura */
+    size_t offset = 3;  /* Começa após START_BYTE + MSGID + COUNT */
+    
     for (uint8_t i = 0; i < tlvCount; i++) {
-        /* Verificar se existem pelo menos 2 bytes para ID + LEN */
+        /* Verificar se cabe pelo menos ID + LEN */
         if (offset + 2 > length - 1) {
             DEBUG_PRINT("ERRO: validateMessage — TLV[%d] header truncado\n", i);
             return 0;
         }
-
+        
         uint8_t tlvLen = buffer[offset + 1];
-
-        /* Verificar se o payload cabe no buffer restante */
+        
+        /* Verificar se o payload cabe no buffer */
         if (offset + 2 + tlvLen > length - 1) {
             DEBUG_PRINT("ERRO: validateMessage — payload TLV[%d] truncado (len=%d)\n", i, tlvLen);
             return 0;
         }
-
-        /* Aviso para payloads que excedem o máximo (não crítico) */
+        
+        /* Aviso para depuração (não crítico) */
         if (tlvLen > MAX_TLV_DATA) {
             DEBUG_PRINT("AVISO: validateMessage — TLV[%d] len=%d > MAX_TLV_DATA\n", i, tlvLen);
         }
-
-        offset += 2 + tlvLen;  /* Avançar para o próximo TLV */
+        
+        offset += 2 + tlvLen;
     }
-
-    /* ================================================================
-     * CAMADA 5: VERIFICAÇÃO DE INTEGRIDADE (CRC8)
-     * ================================================================
-     * O CRC8 deve ocupar exatamente a última posição do buffer.
-     * Se o offset não coincide com length - 1, há incoerência.
-     */
+    
+    /* 5. Verificar se o CRC está na posição esperada */
     if (offset + 1 != length) {
-        DEBUG_PRINT("ERRO: validateMessage — tamanho incoerente (offset=%zu, length=%zu)\n",
+        DEBUG_PRINT("ERRO: validateMessage — tamanho incoerente (offset=%zu, length=%zu)\n", 
                     offset, length);
         return 0;
     }
-
-    /* Calcular CRC8 sobre todo o conteúdo (excluindo o próprio CRC) */
+    
+    /* 6. Verificar CRC8 */
     uint8_t crcCalculado = calcCRC8(buffer, offset);
     uint8_t crcRecebido = buffer[length - 1];
-
+    
     if (crcCalculado != crcRecebido) {
-        DEBUG_PRINT("ERRO: validateMessage — CRC8 falhou (calc=0x%02X, recv=0x%02X)\n",
+        DEBUG_PRINT("ERRO: validateMessage — CRC8 falhou (calc=0x%02X, recv=0x%02X)\n", 
                     crcCalculado, crcRecebido);
         return 0;
     }
-
+    
     DEBUG_PRINT("validateMessage: mensagem válida — msgID=0x%02X, %d TLVs\n", msgID, tlvCount);
     return 1;
 }
 
 /* =================================================================================
- * parseTLV — DESSERIALIZAÇÃO DE CAMPOS TLV
+ * parseTLV — EXTRAI CAMPOS TLV DE UM BUFFER BRUTO
  * =================================================================================
- *
- * Extrai sequencialmente os campos TLV de um buffer bruto que contém
- * apenas a sequência de TLVs (sem START_BYTE, MSGID, COUNT, CRC).
- *
- * Cada TLV é lido como:
- *   [ID (1B)] [LEN (1B)] [DATA (LEN bytes)]
- *
- * Os campos são copiados para o array de saída até atingir:
- *   • O fim do buffer de entrada
- *   • O limite MAX_TLV_FIELDS
- *   • Um TLV truncado (LEN maior que o espaço restante)
- *
- * @param data   Buffer com a sequência de TLVs
- * @param length Comprimento do buffer de entrada
- * @param output Array de TLVField de saída (mínimo MAX_TLV_FIELDS)
- * @param count  Número de campos efetivamente extraídos (output)
+ * 
+ * Esta função percorre um buffer que contém apenas a sequência de TLVs
+ * (sem START_BYTE, MSGID, COUNT, CRC) e preenche um array de TLVField.
+ * 
+ * @param data   Buffer com dados TLV
+ * @param length Comprimento do buffer
+ * @param output Array de saída (deve ter capacidade para MAX_TLV_FIELDS)
+ * @param count  Número de campos extraídos (output)
  */
 
 void parseTLV(const uint8_t* data, size_t length, TLVField* output, size_t* count) {
-    /* Validar todos os parâmetros de entrada */
+    /* Validação de parâmetros */
     if (data == nullptr || output == nullptr || count == nullptr) {
         if (count != nullptr) *count = 0;
         DEBUG_PRINT("ERRO: parseTLV — parâmetros inválidos\n");
         return;
     }
-
-    size_t offset = 0;   /* Posição atual no buffer de entrada */
-    size_t idx = 0;      /* Índice atual no array de saída */
-
-    /* Limite máximo de campos a extrair */
+    
+    size_t offset = 0;
+    size_t idx = 0;
+    
+    /* Limitar ao máximo de campos */
     const size_t maxFields = MAX_TLV_FIELDS;
-
-    /* Extrair TLVs sequencialmente até atingir o fim ou o limite */
+    
     while (offset + 2 <= length && idx < maxFields) {
         uint8_t id = data[offset];
         uint8_t len = data[offset + 1];
-
-        /* Verificar se o payload completo cabe no buffer restante */
+        
+        /* Verificar se o payload cabe no buffer */
         if (offset + 2 + len > length) {
             DEBUG_PRINT("AVISO: parseTLV — TLV truncado no índice %zu\n", idx);
             break;
         }
-
-        /* Preencher o campo de saída */
+        
+        /* Preencher campo de saída */
         output[idx].id = id;
         output[idx].len = len;
-
-        /* Copiar payload limitado ao máximo permitido */
+        
+        /* Copiar payload para o campo de saída — limitado a MAX_TLV_DATA
+         * para evitar overflow. Se o payload exceder, é truncado silenciosamente. */
         size_t copyLen = (len <= MAX_TLV_DATA) ? len : MAX_TLV_DATA;
         memcpy(output[idx].data, &data[offset + 2], copyLen);
-
-        /* Se o payload excedeu o máximo, preencher o resto com zeros */
-        if (len > MAX_TLV_DATA) {
-            memset(&output[idx].data[MAX_TLV_DATA], 0, len - MAX_TLV_DATA);
+        
+        /* =================================================================
+         * CRITICAL FIX: Zero-padding CORRETO dentro dos limites do array
+         * =================================================================
+         * BUG ANTERIOR: O memset escrevia para além de output[idx].data[],
+         * corrompendo TLVFields adjacentes no array de saída. O cálculo
+         * usava "len - MAX_TLV_DATA" como tamanho, mas escrevia a partir
+         * de "data[MAX_TLV_DATA]" — para além do fim do array de 32 bytes.
+         *
+         * CORREÇÃO: Preencher com zeros APENAS os bytes restantes dentro
+         * do array data[MAX_TLV_DATA], desde copyLen até MAX_TLV_DATA.
+         * ================================================================= */
+        if (copyLen < MAX_TLV_DATA) {
+            memset(&output[idx].data[copyLen], 0, MAX_TLV_DATA - copyLen);
         }
-
-        offset += 2 + len;  /* Avançar para o próximo TLV no buffer */
-        idx++;              /* Avançar para a próxima posição de saída */
+        
+        offset += 2 + len;
+        idx++;
     }
-
-    *count = idx;  /* Retornar o número total de campos extraídos */
-
-    /* Aviso se sobraram dados não processados no buffer */
+    
+    *count = idx;
+    
     if (idx < maxFields && offset + 2 <= length) {
-        DEBUG_PRINT("AVISO: parseTLV — buffer com dados extra (%zu bytes não processados)\n",
+        DEBUG_PRINT("AVISO: parseTLV — buffer com dados extra (%zu bytes não processados)\n", 
                     length - offset);
     }
+}
+
+/* =================================================================================
+ * FUNÇÕES DE DEBUG
+ * =================================================================================
+ * 
+ * Estas funções são úteis para diagnóstico e desenvolvimento.
+ * Em produção, podem ser desativadas removendo PROTOCOL_DEBUG.
+ */
+
+void printTLVField(const TLVField* field) {
+    if (field == nullptr) {
+        DEBUG_PRINT("TLV: NULL\n");
+        return;
+    }
+    
+    DEBUG_PRINT("  TLV ID:0x%02X LEN:%d DATA:", field->id, field->len);
+    
+    for (uint8_t i = 0; i < field->len && i < 16; i++) {  /* Limitar a 16 bytes para legibilidade */
+        DEBUG_PRINT(" %02X", field->data[i]);
+    }
+    
+    if (field->len > 16) {
+        DEBUG_PRINT(" ... (%d bytes restantes)", field->len - 16);
+    }
+    
+    DEBUG_PRINT("\n");
+}
+
+void printMessage(const TLVMessage* msg) {
+    if (msg == nullptr) {
+        DEBUG_PRINT("Message: NULL\n");
+        return;
+    }
+    
+    DEBUG_PRINT("=== MENSAGEM TLV ===\n");
+    DEBUG_PRINT("  START_BYTE: 0x%02X\n", msg->startByte);
+    DEBUG_PRINT("  MSG ID:     0x%02X\n", msg->msgID);
+    DEBUG_PRINT("  TLV COUNT:  %d\n", msg->tlvCount);
+    DEBUG_PRINT("  CHECKSUM:   0x%02X\n", msg->checksum);
+    
+    for (uint8_t i = 0; i < msg->tlvCount; i++) {
+        printTLVField(&msg->tlvs[i]);
+    }
+    
+    DEBUG_PRINT("========================\n");
 }
