@@ -1,0 +1,73 @@
+# ============================================================================
+# Bythos Protocol — .gitignore
+# Licença: GPL-3.0
+# ============================================================================
+
+# --- Rust ---
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# --- C/C++ ---
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.d
+*.pdb
+*.pch
+*.ilk
+
+# --- Build directories ---
+c_core/build/
+build/
+cmake-build-*/
+
+# --- IDEs e Editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Debug e Core Dumps ---
+core
+core.*
+vgcore.*
+*.dSYM/
+
+# --- Documentação gerada ---
+docs/html/
+docs/_build/
+
+# --- Ficheiros temporários e backup ---
+*.bak
+*.tmp
+*.orig
+*.log
+
+# --- Ambiente e credenciais ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Coverage e profiling ---
+coverage/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.gcov
+
+# --- Tooling ---
+compile_commands.json
+.cache/
+.clangd/
