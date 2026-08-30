@@ -1,0 +1,39 @@
+[package]
+name = "bythos"
+version = "3.0.0"
+edition = "2021"
+authors = ["ShegaPT"]
+description = "Bythos — Protocolo binário TLV para sistemas embedded (UART, LoRa, SPI, I2C, CAN)"
+license = "GPL-3.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+name = "bythos"
+path = "src/lib.rs"
+
+[dependencies]
+esp-idf-sys = { version = "0.37", features = ["std"], optional = true }
+
+[features]
+default = ["std"]
+std = []
+
+# Transportes
+transport-uart = []
+transport-lora = []
+transport-spi = []
+transport-i2c = []
+transport-can = []
+
+# Plataformas
+esp = ["std", "esp-idf-sys"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
