@@ -2,20 +2,20 @@
 
 ## Mensagens do Sistema (0x10-0x1B)
 
-| MsgID | Nome      | Prioridade por defeito | Descrição                                     |
-|:-----:|-----------|:----------------------:|-----------------------------------------------|
-| 0x10  | Heartbeat | Medium                 | Sinal de vida, enviado periodicamente         |
-| 0x11  | Telemetry | Medium                 | Dados de sensores e estado do sistema         |
-| 0x12  | Command   | High                   | Instrução enviada a um módulo                 |
-| 0x13  | Ack       | High                   | Confirmação de receção de mensagem            |
-| 0x14  | Failsafe  | SuperCritical          | Estado de segurança de emergência             |
-| 0x15  | Debug     | Low                    | Mensagens de depuração                        |
-| 0x16  | Video     | Low                    | Dados de vídeo fragmentados                   |
-| 0x17  | Shell     | Medium                 | Acesso a consola remota                       |
-| 0x18  | SiData    | Medium                 | Dados de sensores SI (Sensor Interface)       |
-| 0x19  | Watchdog  | Medium                 | Keepalive de monitorização                    |
-| 0x1A  | Ping      | Medium                 | Teste de conectividade                        |
-| 0x1B  | Clock     | High                   | Sincronização temporal                        |
+| MsgID | Nome      | Prioridade por defeito | Descrição                               |
+|:-----:|-----------|:----------------------:|-----------------------------------------|
+| 0x10  | Heartbeat | Medium                 | Sinal de vida, enviado periodicamente   |
+| 0x11  | Telemetry | Medium                 | Dados de sensores e estado do sistema   |
+| 0x12  | Command   | High                   | Instrução enviada a um módulo           |
+| 0x13  | Ack       | High                   | Confirmação de receção de mensagem      |
+| 0x14  | Failsafe  | SuperCritical          | Estado de segurança de emergência       |
+| 0x15  | Debug     | Low                    | Mensagens de depuração                  |
+| 0x16  | Video     | Low                    | Dados de vídeo fragmentados             |
+| 0x17  | Shell     | Medium                 | Acesso a consola remota                 |
+| 0x18  | SiData    | Medium                 | Dados de sensores SI (Sensor Interface) |
+| 0x19  | Watchdog  | Medium                 | Keepalive de monitorização              |
+| 0x1A  | Ping      | Medium                 | Teste de conectividade                  |
+| 0x1B  | Clock     | High                   | Sincronização temporal                  |
 
 ## Descrição por Mensagem
 
@@ -65,10 +65,10 @@ Sincronização temporal entre módulos.
 
 ## Prioridades de Mensagem
 
-| Prioridade      | Valor | Descrição                              |
-|-----------------|:-----:|----------------------------------------|
-| SuperCritical   | 0     | Processamento imediato (failsafe)      |
-| Critical        | 1     | Processamento urgente                  |
-| High            | 2     | Processamento urgente (comandos, ACK)  |
-| Medium          | 3     | Processamento padrão (telemetry)       |
-| Low             | 4     | Quando disponível (debug, vídeo)       |
+| Prioridade      | Valor | Descrição                             |
+|-----------------|:-----:|---------------------------------------|
+| SuperCritical   | 0     | Processamento imediato (failsafe)     |
+| Critical        | 1     | Processamento urgente                 |
+| High            | 2     | Processamento urgente (comandos, ACK) |
+| Medium          | 3     | Processamento padrão (telemetry)      |
+| Low             | 4     | Quando disponível (debug, vídeo)      |

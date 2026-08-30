@@ -72,70 +72,70 @@ for (int i = 0; i < len; i++) {
 
 ### Protocolo
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_init(msg, node, key)`  | Inicializar mensagem                         |
-| `bythos_set_seq(msg, seq)`    | Definir sequência                            |
-| `bythos_add_tlv_f32(msg, id, v)` | Adicionar campo f32                       |
-| `bythos_add_tlv_f16(msg, id, v)` | Adicionar campo f16                       |
-| `bythos_add_tlv_i32(msg, id, v)` | Adicionar campo i32                       |
-| `bythos_add_tlv_u32(msg, id, v)` | Adicionar campo u32                       |
-| `bythos_add_tlv_u16(msg, id, v)` | Adicionar campo u16                       |
-| `bythos_add_tlv_u8(msg, id, v)`  | Adicionar campo u8                        |
-| `bythos_add_tlv_bool(msg, id, v)`| Adicionar campo bool                      |
-| `bythos_add_tlv_raw(msg, id, d, l)` | Adicionar campo raw                   |
+| Função                                     | Descrição                    |
+|--------------------------------------------|------------------------------|
+| `bythos_init(msg, node, key)`              | Inicializar mensagem         |
+| `bythos_set_seq(msg, seq)`                 | Definir sequência            |
+| `bythos_add_tlv_f32(msg, id, v)`           | Adicionar campo f32          |
+| `bythos_add_tlv_f16(msg, id, v)`           | Adicionar campo f16          |
+| `bythos_add_tlv_i32(msg, id, v)`           | Adicionar campo i32          |
+| `bythos_add_tlv_u32(msg, id, v)`           | Adicionar campo u32          |
+| `bythos_add_tlv_u16(msg, id, v)`           | Adicionar campo u16          |
+| `bythos_add_tlv_u8(msg, id, v)`            | Adicionar campo u8           |
+| `bythos_add_tlv_bool(msg, id, v)`          | Adicionar campo bool         |
+| `bythos_add_tlv_raw(msg, id, d, l)`        | Adicionar campo raw          |
 | `bythos_build_message(msg, mid, buf, len)` | Serializar mensagem          |
-| `bythos_validate_message(buf, len, key)` | Validar mensagem recebida     |
-| `bythos_free_message(msg)`    | Libertar memória da mensagem                  |
+| `bythos_validate_message(buf, len, key)`   | Validar mensagem recebida    |
+| `bythos_free_message(msg)`                 | Libertar memória da mensagem |
 
 ### Parser
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_parser_init(p, key)`  | Inicializar parser                            |
-| `bythos_parser_feed(p, byte)` | Alimentar um byte                             |
-| `bythos_parser_get_message(p)`| Obter mensagem completa                       |
-| `bythos_parser_has_message(p)`| Verificar se há mensagem                      |
-| `bythos_parser_reset(p)`      | Reiniciar parser                              |
+| Função                         | Descrição                |
+|--------------------------------|--------------------------|
+| `bythos_parser_init(p, key)`   | Inicializar parser       |
+| `bythos_parser_feed(p, byte)`  | Alimentar um byte        |
+| `bythos_parser_get_message(p)` | Obter mensagem completa  |
+| `bythos_parser_has_message(p)` | Verificar se há mensagem |
+| `bythos_parser_reset(p)`       | Reiniciar parser         |
 
 ### CRC
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_calc_crc8(data, len)` | Calcular CRC-8/SMBUS                          |
-| `bythos_calc_crc16(data, len)`| Calcular CRC-16/CCITT                         |
+| Função                         | Descrição             |
+|--------------------------------|-----------------------|
+| `bythos_calc_crc8(data, len)`  | Calcular CRC-8/SMBUS  |
+| `bythos_calc_crc16(data, len)` | Calcular CRC-16/CCITT |
 
 ### CAN ID
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_make_can_id(p, src, dst, type)` | Construir CAN ID extended           |
-| `bythos_can_id_priority(id)`  | Extrair prioridade                            |
-| `bythos_can_id_src_group(id)` | Extrair grupo origem                          |
-| `bythos_can_id_dst_group(id)` | Extrair grupo destino                         |
-| `bythos_can_id_msg_type(id)`  | Extrair tipo mensagem                         |
-| `bythos_is_safety_bus_id(id)` | Verificar se é bus de segurança               |
+| Função                                  | Descrição                       |
+|-----------------------------------------|---------------------------------|
+| `bythos_make_can_id(p, src, dst, type)` | Construir CAN ID extended       |
+| `bythos_can_id_priority(id)`            | Extrair prioridade              |
+| `bythos_can_id_src_group(id)`           | Extrair grupo origem            |
+| `bythos_can_id_dst_group(id)`           | Extrair grupo destino           |
+| `bythos_can_id_msg_type(id)`            | Extrair tipo mensagem           |
+| `bythos_is_safety_bus_id(id)`           | Verificar se é bus de segurança |
 
 ### FieldID
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_field_id_encode(t, id)`| Codificar FieldID                            |
-| `bythos_field_id_decode(fid)` | Decodificar FieldID                           |
+| Função                          | Descrição           |
+|---------------------------------|---------------------|
+| `bythos_field_id_encode(t, id)` | Codificar FieldID   |
+| `bythos_field_id_decode(fid)`   | Decodificar FieldID |
 
 ### Assinatura
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_compute_signature(k, m, lo, hi)` | Calcular assinatura                  |
-| `bythos_validate_signature(s, k, m, lo, hi)` | Validar assinatura            |
+| Função                                       | Descrição           |
+|----------------------------------------------|---------------------|
+| `bythos_compute_signature(k, m, lo, hi)`     | Calcular assinatura |
+| `bythos_validate_signature(s, k, m, lo, hi)` | Validar assinatura  |
 
 ### Utilidades
 
-| Função                          | Descrição                                    |
-|---------------------------------|----------------------------------------------|
-| `bythos_msg_id_valid(id)`     | Verificar MsgID válido                        |
-| `bythos_is_valid_field_id(id)`| Verificar FieldID válido                      |
+| Função                         | Descrição                |
+|--------------------------------|--------------------------|
+| `bythos_msg_id_valid(id)`      | Verificar MsgID válido   |
+| `bythos_is_valid_field_id(id)` | Verificar FieldID válido |
 
 ---
 

@@ -37,10 +37,10 @@ let size = builder.build(0x11, &mut buffer).unwrap();
 
 ### Criação
 
-| Método                        | Descrição                                    |
-|-------------------------------|----------------------------------------------|
-| `TLVBuilder::new(node_id, key)` | Criar novo builder                         |
-| `set_seq(seq)`                | Definir número de sequência (u16)            |
+| Método                          | Descrição                                    |
+|---------------------------------|----------------------------------------------|
+| `TLVBuilder::new(node_id, key)` | Criar novo builder                           |
+| `set_seq(seq)`                  | Definir número de sequência (u16)            |
 
 ### Adicionar Campos
 

@@ -31,16 +31,16 @@ O Bythos Protocol é um protocolo de comunicação binário compartilhado por to
 
 ### 2.2 Tamanhos
 
-| Componente         | Tamanho (bytes) |
-|--------------------|:--------------:|
-| Header (fixed)     | 7              |
-| Signature          | 1              |
-| CRC16              | 2              |
-| **Overhead Total** | **10**         |
-| TLV Header (por campo) | 2         |
-| TLV Data (máx. por campo) | 32      |
-| Máx. campos TLV por msg | 32        |
-| **Máx. mensagem** | **1098**       |
+| Componente                | Tamanho (bytes) |
+|---------------------------|:---------------:|
+| Header (fixed)            | 7               |
+| Signature                 | 1               |
+| CRC16                     | 2               |
+| **Overhead Total**        | **10**          |
+| TLV Header (por campo)    | 2               |
+| TLV Data (máx. por campo) | 32              |
+| Máx. campos TLV por msg   | 32              |
+| **Máx. mensagem**         | **1098**        |
 
 ### 2.3 Campos do Header
 
@@ -98,14 +98,14 @@ O FieldID de 1 byte combina tipo e identificador:
 
 | Tipo  | Faixa FieldID | Exemplos               |
 |-------|:-------------:|------------------------|
-| Raw   | 0x00 - 0x1F  | VideoPayload (0x00)    |
-| f32   | 0x20 - 0x3F  | GPS, IMU, Energia      |
-| f16   | 0x40 - 0x5F  | (reservado)            |
-| i32   | 0x60 - 0x7F  | (reservado)            |
-| u32   | 0x80 - 0x9F  | SystemUptime, etc.     |
-| u16   | 0xA0 - 0xBF  | FlightLoopTime, etc.   |
-| u8    | 0xC0 - 0xDF  | SystemState, etc.      |
-| Bool  | 0xE0 - 0xFF  | (reservado)            |
+| Raw   | 0x00 - 0x1F   | VideoPayload (0x00)    |
+| f32   | 0x20 - 0x3F   | GPS, IMU, Energia      |
+| f16   | 0x40 - 0x5F   | (reservado)            |
+| i32   | 0x60 - 0x7F   | (reservado)            |
+| u32   | 0x80 - 0x9F   | SystemUptime, etc.     |
+| u16   | 0xA0 - 0xBF   | FlightLoopTime, etc.   |
+| u8    | 0xC0 - 0xDF   | SystemState, etc.      |
+| Bool  | 0xE0 - 0xFF   | (reservado)            |
 
 ### 3.3 Fórmula
 
