@@ -1,326 +1,265 @@
-//! # TLVBuilder — Construtor de Mensagens Bythos v3.0.0
+//! # Construtor Bythos — Mensagens Fluentes e Seladas (v4.0.0)
 //!
-//! Implementação do construtor fluent para mensagens Bythos v3.0.0.
-//! O TLVBuilder permite construir mensagens de forma segura e eficiente,
-//! adicionando campos um a um e serializando a mensagem completa no final.
-//!
-//! ## Formato da Mensagem
-//!
-//! ```text
-//! [START_BYTE][VERSION][NODE_ID][MSG_ID][SEQ_NUM_LO][SEQ_NUM_HI]
-//! [TLV_COUNT][TLV_FIELDS...][SIGNATURE][CRC16_LO][CRC16_HI]
-//! ```
-//!
-//! ## Uso
+//! O `BythosBuilder` é a forma recomendada de emitir: acumula campos tipados,
+//! conta o `CTR` sozinho e sela com `TAG` ao construir. Quem usa o construtor
+//! nunca toca em `SEC_HDR`, `TAG` ou CRC — esses bytes nascem no `build()`.
 //!
 //! ```rust
-//! use bythos::protocol::builder::TLVBuilder;
+//! use bythos::protocol::builder::BythosBuilder;
+//! use bythos::protocol::secure::SealConfig;
+//! use bythos::protocol::types::MAX_MESSAGE_SIZE;
 //!
-//! let mut builder = TLVBuilder::new(0x06, 0x42);
-//! builder.set_seq(1);
-//! builder.add_u8_field(0, 2).unwrap();
-//! builder.add_f32_field(0x10, 1.5).unwrap();
-//!
-//! let mut buffer = [0u8; 1098];
-//! let size = builder.build(0x11, &mut buffer).unwrap();
+//! let key = [0x42u8; 32];
+//! let mut b = BythosBuilder::new(27, SealConfig::software(0, key, 27));
+//! b.set_seq(7);
+//! b.add_u8_field(0, 2).unwrap();      // estado do sistema
+//! b.add_f32_field(6, 40.0).unwrap();  // latitude
+//! let mut buf = [0u8; MAX_MESSAGE_SIZE];
+//! let n = b.build(0x11, 0xFFFF, &mut buf).unwrap(); // telemetria em difusão
 //! ```
 
+use crate::protocol::codec::{build_message_sealed, ProtocolError, SoftwareTagger};
+use crate::protocol::secure::SealConfig;
 use crate::protocol::types::*;
-use crate::protocol::crc16::calc_crc16;
-use crate::protocol::codec::ProtocolError;
 
-/// Construtor fluente para mensagens Bythos v3.0.0.
+// ============================================================================
+// CONSTRUTOR
+// ============================================================================
+
+/// Construtor fluente de tramas Bythos V4 seladas.
 ///
-/// Permite construir mensagens Bythos de forma iterativa, adicionando campos
-/// com diferentes tipos de dados. A mensagem é serializada e validada
-/// quando `build()` é chamado.
-///
-/// O builder mantém internamente um array de campos TLV e um contador.
-/// Quando `build()` é chamado, serializa todos os campos no buffer de
-/// saída, calcula a assinatura e o CRC16.
-pub struct TLVBuilder {
-    /// Array interno de campos TLV.
-    fields: [TLVField; MAX_TLV_FIELDS],
-    /// Número de campos adicionados.
-    tlv_count: u8,
-    /// ID do nó transmissor (grupo CAN).
-    node_id: u8,
-    /// Número de sequência da mensagem.
-    seq_num: u16,
-    /// Chave de assinatura (XOR key).
-    signature_key: u8,
+/// Guarda o rascunho (campos + rota + sequência) e o selo (`SealConfig` com
+/// chave de software + contador). Cada `build()` consome um `CTR` — construir
+/// duas vezes sem mudar nada produz duas tramas distintas no fio, como deve ser
+/// (repetir bytes seria repetir `CTR`, e a janela do recetor morderia).
+pub struct BythosBuilder {
+    /// Rascunho da mensagem (campos, origem, sequência, saltos).
+    draft: BythosMessage,
+    /// Selo: ranhura de chave + chave de software + próximo contador.
+    seal: SealConfig,
 }
 
-impl TLVBuilder {
-    /// Cria um novo TLVBuilder para o nó especificado.
+impl BythosBuilder {
+    /// Cria um construtor para o endereço `src` com o selo dado.
     ///
-    /// # Arguments
-    ///
-    /// * `node_id` — ID do grupo CAN deste nó.
-    /// * `key` — Chave de assinatura partilhada (0x00 = sem assinatura).
-    ///
-    /// # Returns
-    ///
-    /// Um novo TLVBuilder pronto para uso.
-    pub fn new(node_id: u8, key: u8) -> Self {
-        Self {
-            fields: [TLVField::new(); MAX_TLV_FIELDS],
-            tlv_count: 0,
-            node_id,
-            seq_num: 0,
-            signature_key: key,
-        }
+    /// O `seal.src` deve coincidir com `src` — o construtor não impõe (o fio
+    /// é que manda), mas divergir é forjar origem própria, sem sentido.
+    pub fn new(src: u16, seal: SealConfig) -> Self {
+        let mut draft = BythosMessage::new();
+        draft.src = src;
+        Self { draft, seal }
     }
 
-    /// Reseta o builder para o estado inicial, mantendo node_id e key.
+    /// Repõe campos e sequência; mantém origem, saltos e selo.
+    ///
+    /// Reutilizar o construtor entre emissões evita realocar o rascunho — e
+    /// manter o selo garante que o `CTR` nunca anda para trás entre mensagens.
     pub fn reset(&mut self) {
-        self.tlv_count = 0;
-        self.seq_num = 0;
-        for field in self.fields.iter_mut() {
-            *field = TLVField::new();
-        }
+        let src = self.draft.src;
+        let hops = self.draft.hops;
+        self.draft.clear();
+        self.draft.src = src;
+        self.draft.hops = hops;
     }
 
-    /// Retorna o número de campos TLV adicionados.
-    pub fn get_tlv_count(&self) -> u8 {
-        self.tlv_count
+    /// Nº de campos acumulados.
+    pub fn field_count(&self) -> u8 {
+        self.draft.field_count
     }
 
-    /// Define o número de sequência da mensagem.
+    /// Define a sequência (diagnóstico; anti-replay usa o `CTR`, não isto).
     pub fn set_seq(&mut self, seq: u16) {
-        self.seq_num = seq;
+        self.draft.seq_num = seq;
     }
 
-    /// Retorna o número de sequência atual.
+    /// Lê a sequência atual.
     pub fn get_seq(&self) -> u16 {
-        self.seq_num
+        self.draft.seq_num
     }
 
-    /// Define a chave de assinatura.
-    pub fn set_key(&mut self, key: u8) {
-        self.signature_key = key;
+    /// Define os saltos restantes (por defeito `HOP_DEFAULT`).
+    pub fn set_hops(&mut self, hops: u8) {
+        self.draft.hops = hops;
     }
 
-    /// Retorna o node_id configurado.
-    pub fn get_node_id(&self) -> u8 {
-        self.node_id
+    /// Lê o endereço de origem configurado.
+    pub fn get_src(&self) -> u16 {
+        self.draft.src
+    }
+
+    /// Troca a ranhura de chave (rotação sem reconstruir o resto).
+    pub fn set_key_id(&mut self, key_id: u8) {
+        self.seal.key_id = key_id;
     }
 
     // ========================================================================
-    // MÉTODOS DE ADICIONAR CAMPOS — RAW
+    // CAMPOS — CARGA BRUTA
     // ========================================================================
 
-    /// Adiciona um campo TLV com dados brutos (bytes).
+    /// Adiciona campo com identificador já codificado e carga bruta.
     ///
-    /// # Arguments
-    ///
-    /// * `id` — FieldID codificado ([TYPE:3][ID:5]).
-    /// * `data` — Dados a incluir no campo.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` em sucesso, `Err(ProtocolError::TooManyFields)` se o número
-    /// máximo de campos for excedido.
+    /// Recusa (nunca trunca) se a mensagem estiver cheia ou a carga exceder
+    /// `MAX_FIELD_DATA` — ver `BythosField::with_data` para o porquê.
     pub fn add_raw(&mut self, id: u8, data: &[u8]) -> Result<(), ProtocolError> {
-        if self.tlv_count as usize >= MAX_TLV_FIELDS {
+        if self.draft.field_count as usize >= MAX_FIELDS {
             return Err(ProtocolError::TooManyFields);
         }
-        let len = data.len().min(MAX_TLV_DATA);
-        let field = TLVField {
-            id,
-            len: len as u8,
-            data: {
-                let mut arr = [0u8; MAX_TLV_DATA];
-                arr[..len].copy_from_slice(&data[..len]);
-                arr
-            },
-        };
-        self.fields[self.tlv_count as usize] = field;
-        self.tlv_count += 1;
-        Ok(())
+        match BythosField::with_data(id, data) {
+            Some(field) => {
+                self.draft.fields[self.draft.field_count as usize] = field;
+                self.draft.field_count += 1;
+                Ok(())
+            }
+            None => Err(ProtocolError::FieldDataTooLong),
+        }
     }
 
     // ========================================================================
-    // MÉTODOS DE ADICIONAR CAMPOS — TIPOS ESPECÍFICOS
+    // CAMPOS — TIPOS (codificam o identificador sozinhos)
     // ========================================================================
 
-    /// Adiciona um campo TLV com valor float (32 bits).
-    /// O FieldID é codificado automaticamente com tipo=1 (f32).
+    /// Adiciona `f32` com identificador já codificado.
     pub fn add_f32(&mut self, id: u8, value: f32) -> Result<(), ProtocolError> {
         self.add_raw(id, &float_to_bytes(value))
     }
 
-    /// Adiciona um campo TLV com valor float (32 bits) usando FieldID com tipo.
-    /// `field_id` é o ID lógico (0-31), o tipo é codificado automaticamente.
+    /// Adiciona `f32` pelo id lógico (codifica `Float32` automaticamente).
     pub fn add_f32_field(&mut self, field_id: u8, value: f32) -> Result<(), ProtocolError> {
-        let encoded = field_id_encode(FieldType::Float32 as u8, field_id);
-        self.add_f32(encoded, value)
+        self.add_f32(
+            bythos_field_id_encode(BythosFieldType::Float32 as u8, field_id),
+            value,
+        )
     }
 
-    /// Adiciona um campo TLV com valor inteiro sinalizado (32 bits).
+    /// Adiciona `f16` (meia precisão) pelo id lógico.
+    ///
+    /// Fecha a dívida V3: o tipo existia no fio mas sem construtor. Útil para
+    /// telemetria densa (metade dos bytes, precisão de sobra para °C, % e m/s).
+    pub fn add_f16_field(&mut self, field_id: u8, value: f32) -> Result<(), ProtocolError> {
+        let half = f32_to_f16(value);
+        self.add_raw(
+            bythos_field_id_encode(BythosFieldType::Float16 as u8, field_id),
+            &half.to_le_bytes(),
+        )
+    }
+
+    /// Adiciona `i32` com identificador já codificado.
     pub fn add_i32(&mut self, id: u8, value: i32) -> Result<(), ProtocolError> {
         self.add_raw(id, &int32_to_bytes(value))
     }
 
-    /// Adiciona um campo TLV com valor i32 usando FieldID com tipo.
+    /// Adiciona `i32` pelo id lógico.
     pub fn add_i32_field(&mut self, field_id: u8, value: i32) -> Result<(), ProtocolError> {
-        let encoded = field_id_encode(FieldType::Int32 as u8, field_id);
-        self.add_i32(encoded, value)
+        self.add_i32(
+            bythos_field_id_encode(BythosFieldType::Int32 as u8, field_id),
+            value,
+        )
     }
 
-    /// Adiciona um campo TLV com valor inteiro sem sinal (32 bits).
+    /// Adiciona `u32` com identificador já codificado.
     pub fn add_u32(&mut self, id: u8, value: u32) -> Result<(), ProtocolError> {
         self.add_raw(id, &uint32_to_bytes(value))
     }
 
-    /// Adiciona um campo TLV com valor u32 usando FieldID com tipo.
+    /// Adiciona `u32` pelo id lógico.
     pub fn add_u32_field(&mut self, field_id: u8, value: u32) -> Result<(), ProtocolError> {
-        let encoded = field_id_encode(FieldType::Uint32 as u8, field_id);
-        self.add_u32(encoded, value)
+        self.add_u32(
+            bythos_field_id_encode(BythosFieldType::Uint32 as u8, field_id),
+            value,
+        )
     }
 
-    /// Adiciona um campo TLV com valor inteiro sem sinal (16 bits).
+    /// Adiciona `u16` com identificador já codificado.
     pub fn add_u16(&mut self, id: u8, value: u16) -> Result<(), ProtocolError> {
         self.add_raw(id, &uint16_to_bytes(value))
     }
 
-    /// Adiciona um campo TLV com valor u16 usando FieldID com tipo.
+    /// Adiciona `u16` pelo id lógico.
     pub fn add_u16_field(&mut self, field_id: u8, value: u16) -> Result<(), ProtocolError> {
-        let encoded = field_id_encode(FieldType::Uint16 as u8, field_id);
-        self.add_u16(encoded, value)
+        self.add_u16(
+            bythos_field_id_encode(BythosFieldType::Uint16 as u8, field_id),
+            value,
+        )
     }
 
-    /// Adiciona um campo TLV com valor inteiro sem sinal (8 bits).
+    /// Adiciona `u8` com identificador já codificado.
     pub fn add_u8(&mut self, id: u8, value: u8) -> Result<(), ProtocolError> {
         self.add_raw(id, &[value])
     }
 
-    /// Adiciona um campo TLV com valor u8 usando FieldID com tipo.
+    /// Adiciona `u8` pelo id lógico.
     pub fn add_u8_field(&mut self, field_id: u8, value: u8) -> Result<(), ProtocolError> {
-        let encoded = field_id_encode(FieldType::Uint8 as u8, field_id);
-        self.add_u8(encoded, value)
+        self.add_u8(
+            bythos_field_id_encode(BythosFieldType::Uint8 as u8, field_id),
+            value,
+        )
     }
 
-    /// Adiciona um campo TLV com valor booleano (1 byte).
+    /// Adiciona booleano com identificador já codificado.
     pub fn add_bool(&mut self, id: u8, value: bool) -> Result<(), ProtocolError> {
-        self.add_raw(id, &[if value { 1u8 } else { 0u8 }])
+        self.add_raw(id, &[u8::from(value)])
     }
 
-    /// Adiciona um campo TLV com valor bool usando FieldID com tipo.
+    /// Adiciona booleano pelo id lógico.
     pub fn add_bool_field(&mut self, field_id: u8, value: bool) -> Result<(), ProtocolError> {
-        let encoded = field_id_encode(FieldType::Bool as u8, field_id);
-        self.add_bool(encoded, value)
+        self.add_bool(
+            bythos_field_id_encode(BythosFieldType::Bool as u8, field_id),
+            value,
+        )
     }
 
     // ========================================================================
-    // SERIALIZAÇÃO
+    // SELAGEM
     // ========================================================================
 
-    /// Serializa a mensagem Bythos completa no buffer de saída.
+    /// Sela e serializa a trama para `dst`.
     ///
-    /// Constrói a mensagem no formato:
-    /// ```text
-    /// [START_BYTE][VERSION][NODE_ID][MSG_ID][SEQ_NUM_LO][SEQ_NUM_HI]
-    /// [TLV_COUNT][TLV_FIELDS...][SIGNATURE][CRC16_LO][CRC16_HI]
-    /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `msg_id` — Identificador do tipo de mensagem.
-    /// * `buffer` — Buffer de saída para serialização.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(size)` com o número total de bytes serializados em sucesso,
-    /// ou `Err(ProtocolError)` em caso de erro.
-    pub fn build(&self, msg_id: u8, buffer: &mut [u8]) -> Result<usize, ProtocolError> {
-        // Calcular tamanho necessário
-        let fields_size: usize = (0..self.tlv_count as usize)
-            .map(|i| TLV_HEADER_SIZE + self.fields[i].len as usize)
-            .sum();
-        let required_size = BYTHOS_HEADER_SIZE + fields_size + SIGNATURE_SIZE + CRC16_SIZE;
-
-        if buffer.len() < required_size {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-
-        let mut offset = 0;
-
-        // --- Cabeçalho Bythos (7 bytes) ---
-
-        // START_BYTE
-        buffer[offset] = START_BYTE;
-        offset += 1;
-
-        // VERSION
-        buffer[offset] = BYTHOS_VERSION;
-        offset += 1;
-
-        // NODE_ID
-        buffer[offset] = self.node_id;
-        offset += 1;
-
-        // MSG_ID
-        buffer[offset] = msg_id;
-        offset += 1;
-
-        // SEQ_NUM (2 bytes, little-endian)
-        let seq_bytes = self.seq_num.to_le_bytes();
-        buffer[offset] = seq_bytes[0];
-        offset += 1;
-        buffer[offset] = seq_bytes[1];
-        offset += 1;
-
-        // TLV_COUNT
-        buffer[offset] = self.tlv_count;
-        offset += 1;
-
-        // --- Campos TLV ---
-        for i in 0..self.tlv_count as usize {
-            let field = &self.fields[i];
-            buffer[offset] = field.id;
-            offset += 1;
-            buffer[offset] = field.len;
-            offset += 1;
-            let len = field.len as usize;
-            buffer[offset..offset + len].copy_from_slice(&field.data[..len]);
-            offset += len;
-        }
-
-        // --- Assinatura ---
-        let signature = compute_signature(
-            self.signature_key,
+    /// Consome um `CTR` do selo (mesmo em erro de tampão? **não** — o contador
+    /// só avança após selagem bem-sucedida, para um `BufferTooSmall` não queimar
+    /// um contador e abrir buraco na janela do recetor).
+    pub fn build(
+        &mut self,
+        msg_id: u8,
+        dst: u16,
+        buffer: &mut [u8],
+    ) -> Result<usize, ProtocolError> {
+        let ctr = self.seal.next_ctr & 0xFF_FFFF;
+        let mut tagger = SoftwareTagger { key: self.seal.key };
+        let n = build_message_sealed(
+            &self.draft,
             msg_id,
-            seq_bytes[0],
-            seq_bytes[1],
-        );
-        buffer[offset] = signature;
-        offset += 1;
-
-        // --- CRC16 (sobre todos os bytes exceto o CRC em si) ---
-        let crc = calc_crc16(&buffer[..offset]);
-        let crc_bytes = crc.to_le_bytes();
-        buffer[offset] = crc_bytes[0];
-        offset += 1;
-        buffer[offset] = crc_bytes[1];
-        offset += 1;
-
-        Ok(offset)
+            dst,
+            self.seal.key_id,
+            ctr,
+            &mut tagger,
+            buffer,
+        )?;
+        // Só avança depois de selar com sucesso (ver doc acima).
+        self.seal.next_ctr = self.seal.next_ctr.wrapping_add(1) & 0xFF_FFFF;
+        Ok(n)
     }
 
-    /// Serializa a mensagem Bythos completa com msg_id específico.
-    ///
-    /// Equivalente a `build(msg_id, buffer)`, mantido por compatibilidade.
-    pub fn serialize(&self, msg_id: u8, buffer: &mut [u8]) -> Result<usize, ProtocolError> {
-        self.build(msg_id, buffer)
+    /// Sinónimo de `build` (compatibilidade de leitura com a V3).
+    pub fn serialize(
+        &mut self,
+        msg_id: u8,
+        dst: u16,
+        buffer: &mut [u8],
+    ) -> Result<usize, ProtocolError> {
+        self.build(msg_id, dst, buffer)
     }
 }
 
-impl Default for TLVBuilder {
+impl Default for BythosBuilder {
+    /// Construtor vazio (origem 0, selo de software zerado — só para testes).
     fn default() -> Self {
-        Self::new(0, 0)
+        Self::new(0, SealConfig::software(0, [0u8; 32], 0))
     }
 }
+
+/// Nome V3 do construtor (migração de uma release).
+#[deprecated(since = "4.0.0", note = "usar `BythosBuilder`")]
+pub type TLVBuilder = BythosBuilder;
 
 // ============================================================================
 // TESTES UNITÁRIOS
@@ -329,214 +268,153 @@ impl Default for TLVBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::crc16::verify_crc16;
+    use crate::protocol::secure::PeerTable;
 
-    #[test]
-    fn test_builder_new() {
-        let builder = TLVBuilder::new(0x06, 0x42);
-        assert_eq!(builder.get_tlv_count(), 0);
-        assert_eq!(builder.get_node_id(), 0x06);
+    /// Construtor de teste: origem 6, chave fixa.
+    fn tb() -> BythosBuilder {
+        BythosBuilder::new(6, SealConfig::software(0, [0x42u8; 32], 6))
     }
 
     #[test]
-    fn test_builder_add_u8() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8(0xC0, 0x02).unwrap();
-        assert_eq!(builder.get_tlv_count(), 1);
+    fn test_construtor_base() {
+        let b = tb();
+        assert_eq!(b.field_count(), 0);
+        assert_eq!(b.get_src(), 6);
     }
 
     #[test]
-    fn test_builder_add_u8_field() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 0x02).unwrap(); // type=6(u8) + id=0 → 0xC0
-        assert_eq!(builder.get_tlv_count(), 1);
-        assert_eq!(builder.fields[0].id, 0xC0);
+    fn test_adiciona_tipos() {
+        let mut b = tb();
+        b.add_u8(0xC0, 0x02).unwrap();
+        b.add_u16(0xA0, 0x1234).unwrap();
+        b.add_u32(0x82, 0xDEADBEEF).unwrap();
+        b.add_i32(0x60, -12345).unwrap();
+        b.add_f32(0x30, 2.5).unwrap();
+        b.add_bool(0xE0, true).unwrap();
+        assert_eq!(b.field_count(), 6);
     }
 
     #[test]
-    fn test_builder_add_u16() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u16(0xA0, 0x1234).unwrap();
-        assert_eq!(builder.get_tlv_count(), 1);
+    fn test_codificacao_automatica() {
+        // Ids lógicos viram bytes do catálogo sem intervenção.
+        let mut b = tb();
+        b.add_u8_field(0, 0x02).unwrap();
+        assert_eq!(b.draft.fields[0].id, 0xC0);
+        b.add_f32_field(6, -33.9).unwrap();
+        assert_eq!(b.draft.fields[1].id, 0x26);
+        b.add_f16_field(4, 1.5).unwrap();
+        assert_eq!(b.draft.fields[2].len, 2);
     }
 
     #[test]
-    fn test_builder_add_u32() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u32(0x82, 0xDEADBEEF).unwrap();
-        assert_eq!(builder.get_tlv_count(), 1);
+    fn test_recusa_em_vez_de_truncar() {
+        // 33 B: erro honesto (a V3 cortava em silêncio).
+        let mut b = tb();
+        assert_eq!(
+            b.add_raw(0x00, &[0u8; 33]),
+            Err(ProtocolError::FieldDataTooLong)
+        );
+        assert_eq!(b.field_count(), 0);
     }
 
     #[test]
-    fn test_builder_add_i32() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_i32(0x60, -12345).unwrap();
-        assert_eq!(builder.get_tlv_count(), 1);
-    }
-
-    #[test]
-    fn test_builder_add_f32() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_f32(0x30, 3.14).unwrap();
-        assert_eq!(builder.get_tlv_count(), 1);
-    }
-
-    #[test]
-    fn test_builder_add_f32_field() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_f32_field(0x10, 1.5).unwrap(); // id=0x10 → TYPE=1(f32) + ID=0x10 → 0x30
-        assert_eq!(builder.get_tlv_count(), 1);
-        assert_eq!(builder.fields[0].id, 0x30);
-    }
-
-    #[test]
-    fn test_builder_add_raw() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        let data = [1u8, 2, 3, 4, 5];
-        builder.add_raw(0x00, &data).unwrap(); // raw type
-        assert_eq!(builder.get_tlv_count(), 1);
-    }
-
-    #[test]
-    fn test_builder_add_bool() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_bool(0xE0, true).unwrap();
-        assert_eq!(builder.get_tlv_count(), 1);
-        assert_eq!(builder.fields[0].data[0], 1);
-    }
-
-    #[test]
-    fn test_builder_multiple_fields() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 2).unwrap();     // State
-        builder.add_f32_field(0x10, 1.5).unwrap(); // Roll
-        builder.add_u16_field(0x20, 42).unwrap(); // FrameId
-        builder.add_u8_field(3, 0).unwrap();      // ChunkId
-        assert_eq!(builder.get_tlv_count(), 4);
-    }
-
-    #[test]
-    fn test_builder_build() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 2).unwrap();
-        builder.add_f32_field(0x10, 1.5).unwrap();
-        builder.set_seq(42);
-
-        let mut buffer = [0u8; 1098];
-        let size = builder.build(0x11, &mut buffer).unwrap();
-
-        // Verificar cabeçalho Bythos
-        assert_eq!(buffer[0], START_BYTE);       // 0xAA
-        assert_eq!(buffer[1], BYTHOS_VERSION);   // 0x03
-        assert_eq!(buffer[2], 0x06);             // node_id
-        assert_eq!(buffer[3], 0x11);             // msg_id (Telemetry)
-        assert_eq!(buffer[4], 42);               // seq_lo
-        assert_eq!(buffer[5], 0);                // seq_hi
-        assert_eq!(buffer[6], 2);                // tlv_count
-
-        // Verificar que o tamanho é razoável
-        assert!(size > BYTHOS_OVERHEAD);
-        assert!(size <= MAX_MESSAGE_SIZE);
-    }
-
-    #[test]
-    fn test_builder_build_verifies_crc() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 2).unwrap();
-        builder.set_seq(1);
-
-        let mut buffer = [0u8; 1098];
-        let size = builder.build(0x11, &mut buffer).unwrap();
-
-        // CRC deve ser válido (últimos 2 bytes)
-        let crc_offset = size - 2;
-        let crc_lo = buffer[crc_offset];
-        let crc_hi = buffer[crc_offset + 1];
-        let crc = (crc_hi as u16) << 8 | (crc_lo as u16);
-        assert!(verify_crc16(&buffer[..crc_offset], crc));
-    }
-
-    #[test]
-    fn test_builder_build_verifies_signature() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 2).unwrap();
-        builder.set_seq(42);
-
-        let mut buffer = [0u8; 1098];
-        let size = builder.build(0x11, &mut buffer).unwrap();
-
-        // Assinatura: byte antes dos CRC16
-        let sig_offset = size - 3;
-        let signature = buffer[sig_offset];
-        let expected = compute_signature(0x42, 0x11, 42, 0);
-        assert_eq!(signature, expected);
-    }
-
-    #[test]
-    fn test_builder_reset() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 2).unwrap();
-        builder.add_f32_field(0x10, 1.5).unwrap();
-        assert_eq!(builder.get_tlv_count(), 2);
-
-        builder.reset();
-        assert_eq!(builder.get_tlv_count(), 0);
-        assert_eq!(builder.get_seq(), 0);
-        // node_id e key devem ser mantidos
-        assert_eq!(builder.get_node_id(), 0x06);
-    }
-
-    #[test]
-    fn test_builder_overflow() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        for i in 0..MAX_TLV_FIELDS {
-            builder.add_u8(i as u8, 0).unwrap();
+    fn test_transbordo_de_campos() {
+        let mut b = tb();
+        for i in 0..MAX_FIELDS {
+            b.add_u8(0xC0, i as u8).unwrap();
         }
-        assert_eq!(builder.get_tlv_count(), MAX_TLV_FIELDS as u8);
-
-        let result = builder.add_u8(0xFF, 0);
-        assert!(result.is_err());
+        assert_eq!(b.field_count(), MAX_FIELDS as u8);
+        assert_eq!(b.add_u8(0xC0, 0), Err(ProtocolError::TooManyFields));
     }
 
     #[test]
-    fn test_builder_buffer_too_small() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.add_u8_field(0, 2).unwrap();
-
-        let mut buffer = [0u8; 5]; // Buffer muito pequeno
-        let result = builder.build(0x11, &mut buffer);
-        assert!(result.is_err());
+    fn test_sela_no_fio() {
+        // Cabeçalho de 11 B + SEC_HDR com CTR + TAG + CRC.
+        let mut b = tb();
+        b.add_u8_field(0, 2).unwrap();
+        b.set_seq(42);
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let n = b.build(0x11, BROADCAST_ADDR, &mut buf).unwrap();
+        assert_eq!(buf[0], START_BYTE);
+        assert_eq!(buf[1], BYTHOS_VERSION);
+        assert_eq!(&buf[2..4], &6u16.to_le_bytes());
+        assert_eq!(&buf[4..6], &BROADCAST_ADDR.to_le_bytes());
+        assert_eq!(buf[6], 0x11);
+        assert_eq!(&buf[7..9], &42u16.to_le_bytes());
+        assert_eq!(buf[9], 1);
+        assert_eq!(buf[10], HOP_DEFAULT);
+        assert!(n > BYTHOS_OVERHEAD);
+        assert!(n <= MAX_MESSAGE_SIZE);
+        // E valida de ponta a ponta.
+        let mut peers = PeerTable::new();
+        let view =
+            crate::protocol::codec::validate_message(&buf[..n], &[0x42u8; 32], &mut peers).unwrap();
+        assert_eq!(view.header.src, 6);
+        assert_eq!(view.header.ctr, 0);
     }
 
     #[test]
-    fn test_builder_empty_message() {
-        let builder = TLVBuilder::new(0x06, 0x42);
-        let mut buffer = [0u8; 1098];
-        let size = builder.build(0x10, &mut buffer).unwrap(); // Heartbeat
-
-        // Mensagem vazia: header(7) + signature(1) + crc16(2) = 10
-        assert_eq!(size, BYTHOS_OVERHEAD);
-        assert_eq!(buffer[6], 0); // tlv_count = 0
+    fn test_ctr_avanca_por_construcao() {
+        // Duas construções seguidas: CTRs 0 e 1 (nunca repete).
+        let mut b = tb();
+        b.add_u8_field(0, 2).unwrap();
+        let mut buf1 = [0u8; MAX_MESSAGE_SIZE];
+        let mut buf2 = [0u8; MAX_MESSAGE_SIZE];
+        let n1 = b.build(0x11, BROADCAST_ADDR, &mut buf1).unwrap();
+        let n2 = b.build(0x11, BROADCAST_ADDR, &mut buf2).unwrap();
+        let mut peers = PeerTable::new();
+        let v1 = crate::protocol::codec::validate_message(&buf1[..n1], &[0x42u8; 32], &mut peers)
+            .unwrap();
+        let v2 = crate::protocol::codec::validate_message(&buf2[..n2], &[0x42u8; 32], &mut peers)
+            .unwrap();
+        assert_eq!(v1.header.ctr, 0);
+        assert_eq!(v2.header.ctr, 1);
     }
 
     #[test]
-    fn test_builder_full_message_types() {
-        let mut builder = TLVBuilder::new(0x06, 0x42);
-        builder.set_seq(100);
+    fn test_tampao_pequeno_nao_queima_ctr() {
+        // Falha de tampão antes de selar: o CTR fica para a próxima.
+        let mut b = tb();
+        b.add_u8_field(0, 2).unwrap();
+        let mut tiny = [0u8; 5];
+        assert_eq!(
+            b.build(0x11, BROADCAST_ADDR, &mut tiny),
+            Err(ProtocolError::BufferTooSmall)
+        );
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let n = b.build(0x11, BROADCAST_ADDR, &mut buf).unwrap();
+        let mut peers = PeerTable::new();
+        let view =
+            crate::protocol::codec::validate_message(&buf[..n], &[0x42u8; 32], &mut peers).unwrap();
+        assert_eq!(view.header.ctr, 0);
+    }
 
-        builder.add_f32_field(0x06, 40.0).unwrap();   // Latitude
-        builder.add_f32_field(0x07, -8.0).unwrap();    // Longitude
-        builder.add_f32_field(0x10, 0.5).unwrap();     // Roll
-        builder.add_f32_field(0x11, -1.2).unwrap();    // Pitch
-        builder.add_u8_field(0, 4).unwrap();           // State = InFlight
-        builder.add_u8_field(1, 3).unwrap();           // Mode = AltHold
-        builder.add_u32_field(2, 3600).unwrap();       // Uptime
-        builder.add_u8_field(4, 75).unwrap();          // CpuLoad
+    #[test]
+    fn test_mensagem_vazia() {
+        // Só preâmbulo + reboque: 21 B.
+        let mut b = tb();
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let n = b.build(0x10, BROADCAST_ADDR, &mut buf).unwrap();
+        assert_eq!(n, BYTHOS_OVERHEAD);
+        assert_eq!(buf[9], 0);
+    }
 
-        assert_eq!(builder.get_tlv_count(), 8);
-
-        let mut buffer = [0u8; 1098];
-        let size = builder.build(0x11, &mut buffer).unwrap();
-        assert!(size > BYTHOS_OVERHEAD + 8 * TLV_HEADER_SIZE);
+    #[test]
+    fn test_reset_mantem_selo() {
+        let mut b = tb();
+        b.add_u8_field(0, 2).unwrap();
+        b.set_seq(9);
+        b.reset();
+        assert_eq!(b.field_count(), 0);
+        assert_eq!(b.get_seq(), 0);
+        assert_eq!(b.get_src(), 6);
+        // O CTR não anda para trás com o reset.
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        b.add_u8_field(0, 2).unwrap();
+        let n = b.build(0x11, BROADCAST_ADDR, &mut buf).unwrap();
+        let mut peers = PeerTable::new();
+        let view =
+            crate::protocol::codec::validate_message(&buf[..n], &[0x42u8; 32], &mut peers).unwrap();
+        assert_eq!(view.header.ctr, 0);
     }
 }

@@ -7,6 +7,70 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Bythos Bus**: identificador de arbitragem `BythosBusId` (u32,
+  `[PRIO:3][GRUPO:4][ESPÉCIE:4][ORIGEM:16][RES:5]`, menor ganha como no CAN),
+  FFI `bythos_bus_id_*`, C `bythos_bus_id_*` + testes, guia do produto
+  `docs/BYTHOS-BUS.md` (+ espelho EN) com comparativo CAN↔Bythos para clientes
+
+---
+
+## [4.0.0] — 2026-09-26 (branch `V4`)
+
+Bythos em anel com segurança por hardware. Quebra o fio (`VER 0x03 → 0x04`) e a
+nomenclatura pública (só Bythos: sem `CAN`, sem `TLV`, sem `DeviceX`).
+
+### Added
+
+- **Anel fechado**: 2× RJ11 por ponte (`BEFORE`/`AFTER`), 2 pares entrançados
+  (dados + relógio), `BG-0` fecha o anel e gera o relógio, resto regenera
+- **Auto-enumeração**: `Hello`/`Count` (`0x1C`/`0x1D`), endereços `u16` sequenciais,
+  sem declarar IDs; `RingOpen`/`WiringFault` (`0x1E`/`0x1F`) para corte e mis-wire
+- **Sentido mais curto**: `BG-27 → BG-2` sem dar a volta; limite de saltos `u8`
+- **TAG de 4 B** (HMAC-SHA256 truncado, `SEC_HDR` com `KEY_ID` + `CTR` 24-bit)
+  calculado em elemento seguro (ATECC608) ou caminho de software (testes)
+- **Anti-replay**: janela de 64 por `(SRC, KEY_ID)`, tabela de 8 emissores sem heap
+- **f16 funcional** (Rust + C + FFI) e `bool` na FFI — dívida V3 fechada
+- **Vídeo fragmentado** (32 B/fragmento) + remontagem sem heap + **COBS** p/ rádios
+- **Vetor dourado Rust↔C** congelado (`…82234BEF…`) nos dois lados
+- **PCB BythosBridge** descrita (`hardware/bythos-bridge/`): blocos, BOM, pinout
+  RJ11, jumpers `ROOT/NODE` + `S/L`, bring-up em 5 passos
+- **Docs**: `BYTHOS-SPECIFICATION`, `MIGRATION-GUIDE`, `THREAT-MODEL` (nomes
+  canónicos, sem versão no ficheiro)
+- **CI**: fmt + clippy (0 avisos) + testes std/no_std + C + interop
+- Features: `bythos-bus-short/long`, `bythos-rf-tunnel`, `secure-element`,
+  `legacy-v3-compat`; toolchain por defeito `stable` (esp por substituição)
+
+### Changed
+
+- Cabeçalho 7 → 11 B (`SRC`/`DST` u16 + `HOPS`); sobrecarga 10 → 21 B;
+  máximo 1098 → 1205 B; analisador de 9 → 10 estados
+- `no_std` por feature (não por `target_os`); `panic_handler` só em firmware
+- `print_*` só com `std`; `bythos_clear` repõe preâmbulo nos dois lados;
+  prioridade inválida = `Low` em todo o lado; recusar em vez de truncar, sempre
+- Testes: 107 Rust (85 lib + 18 integração + 4 doc) + 13 grupos C;
+  `test_acp.rs` duplicado removido
+
+### Fixed
+
+- OOB em `build` com `len` mentiroso (Rust + C); tampão do analisador medido
+  byte a byte (`ErrOverflow`); timeout do analisador imposto de verdade
+- `validate_signature` com/sem CRC divergente (unificado: CRC antes do TAG)
+- `CTR` aceite de trama forjada envenenava a janela (só entra após TAG válido)
+- Exemplos do README que não compilavam (reescritos e cobertos por doc-test)
+- Contagens de testes na documentação (valores reais)
+
+### Technical Details
+
+- Fio: `[AA][04][SRC:2][DST:2][MSG][SEQ:2][N][HOPS][CAMPOS][KEY+CTR:4][TAG:4][CRC:2]`
+- TAG ~9 µs em software (C, host); com ATECC608 sai da CPU
+- Pior caso 1000 nós ≈ 500 saltos ≈ 0,5–1 ms no sentido curto
+
+---
+
 ## [3.0.0] — 2026-08-29
 
 Reescrita completa do Bythos como biblioteca standalone genérica (Rust + C), removendo toda a dependência do ACP/BeaconFly/Visor.

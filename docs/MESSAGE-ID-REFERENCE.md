@@ -1,3 +1,5 @@
+> **Nota:** guia histórico da API V3 (nomenclatura CAN/TLV). A norma atual é docs/BYTHOS-SPECIFICATION.md e o mapa de migração docs/MIGRATION-GUIDE.md.
+>
 # Bythos v3.0.0 — Referência de MsgIDs
 
 ## Mensagens do Sistema (0x10-0x1B)

@@ -1,9 +1,9 @@
 [package]
 name = "bythos"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
 authors = ["ShegaPT"]
-description = "Bythos — Protocolo binário TLV para sistemas embedded (UART, LoRa, SPI, I2C, CAN)"
+description = "Bythos — Protocolo em anel com segurança por hardware (pontes RS-485 + ATECC608, túnel RF agnóstico)"
 license = "GPL-3.0"
 
 [lib]
@@ -15,17 +15,35 @@ path = "src/lib.rs"
 esp-idf-sys = { version = "0.37", features = ["std"], optional = true }
 
 [features]
+# Perfil normal: com biblioteca padrão (PC, testes, gateways).
 default = ["std"]
 std = []
 
-# Transportes
+# Modo físico do barramento (mesmo cabo RJ, jumper na ponte — ver spec §6).
+# Só um deve estar ativo por compilação de firmware; ambos aceitam TAG de 4 B.
+bythos-bus-short = []
+bythos-bus-long = []
+
+# Túnel opaco para rádios (COBS + fragmentação) — qualquer modem serve.
+bythos-rf-tunnel = []
+
+# Elemento seguro presente na ponte (o TAG calcula-se no ATECC608 via driver
+# do firmware; sem isto, o caminho de software exige chave em RAM com aviso).
+secure-element = []
+
+# Migração: aceita e valida tramas V3 (0x03/XOR) como "legíveis, não confiáveis".
+# Produção nunca liga isto — existe para ler o parque instalado na transição.
+legacy-v3-compat = []
+
+# Nomes antigos de transporte (V3). Vazias, só para não partir builds alheios
+# durante a migração; serão removidas na próxima versão maior.
 transport-uart = []
 transport-lora = []
 transport-spi = []
 transport-i2c = []
 transport-can = []
 
-# Plataformas
+# Plataforma ESP-IDF (mantida da V3).
 esp = ["std", "esp-idf-sys"]
 
 [profile.dev]

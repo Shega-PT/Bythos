@@ -1,21 +1,27 @@
 /**
  * @file bythos.c
- * @brief Bythos Protocol v3.0.0 — C Wrapper Implementation
+ * @brief Bythos Protocol v4.0.0 — Implementação C standalone
  *
- * Implementação do wrapper C para o protocolo Bythos.
- * Este ficheiro contém a lógica de negócio para construção,
- * validação e parsing de mensagens Bythos.
+ * Reimplementação completa em C (sem depender do Rust): o firmware da ponte
+ * compila só isto + o driver I2C do ATECC608. Sem heap em lado nenhum — todos
+ * os tampões são do chamador.
+ *
+ * Convenções (ver bythos.h):
+ * - Nulos e gamas verificam-se sempre; erro nunca é pânico.
+ * - Recusar em vez de truncar (a V3 truncava `min(32)` em silêncio).
+ * - `memcpy` em vez de `union` para ler bits de `float` (a união é
+ *   comportamento indefinido em C estrito e parte em otimização alta).
  *
  * @author ShegaPT
  * @license GPL-3.0
- * @version 3.0.0
+ * @version 4.0.0
  */
 
 #include "bythos.h"
 #include <string.h>
 
 // ============================================================================
-// TABELAS CRC (CCITT)
+// TABELA CRC-16/CCITT (polinómio 0x1021 — 256 entradas em ROM)
 // ============================================================================
 
 static const uint16_t crc16_table[256] = {
@@ -53,7 +59,8 @@ static const uint16_t crc16_table[256] = {
     0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
 };
 
-static uint8_t crc8_table[256] = {
+/* CRC-8/SMBUS legado (migração V3). `const` para viver em ROM, não RAM. */
+static const uint8_t crc8_table[256] = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
     0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
     0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65,
@@ -89,22 +96,16 @@ static uint8_t crc8_table[256] = {
 };
 
 // ============================================================================
-// TABELA DE VALIDAÇÃO DE MSG_ID
+// TABELA DE TIPOS VÁLIDOS (0x10-0x1F)
 // ============================================================================
 
 static const uint8_t valid_msg_ids[] = {
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-    0x18, 0x19, 0x1A, 0x1B
+    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
 };
 #define NUM_VALID_MSG_IDS (sizeof(valid_msg_ids) / sizeof(valid_msg_ids[0]))
 
-// ============================================================================
-// FUNÇÕES AUXILIARES
-// ============================================================================
-
-/**
- * Verifica se um msg_id é válido.
- */
+/** 1 se o tipo de mensagem é conhecido. */
 static int is_valid_msg_id(uint8_t id) {
     for (size_t i = 0; i < NUM_VALID_MSG_IDS; i++) {
         if (valid_msg_ids[i] == id) return 1;
@@ -113,19 +114,13 @@ static int is_valid_msg_id(uint8_t id) {
 }
 
 /**
- * Verifica se um FieldID tem tipo válido (bits 7-5 = 0-7).
- */
-/**
- * Verifica se um field_id tem um tipo válido (bits 7-5).
- * Aceita qualquer valor 0-7, pois o protocolo suporta qualquer field_type.
- * A validação específica do domínio é feita pelo aplicação.
+ * 1 se o identificador tem tipo embutido válido.
  *
- * @param field_id ID do campo (8 bits)
- * @return         1 se válido, 0 caso contrário
+ * Nota honesta (igual ao Rust): qualquer byte tem tipo 0-7, por isso isto é
+ * barreira de leitura, não prova — o aperto real é LEN-por-tipo na validação.
  */
 static int is_valid_field_id(uint8_t field_id) {
-    uint8_t field_type = (field_id >> 5) & 0x07;
-    return field_type <= 7;
+    return ((field_id >> 5) & 0x07) <= 7;
 }
 
 // ============================================================================
@@ -134,17 +129,15 @@ static int is_valid_field_id(uint8_t field_id) {
 
 uint16_t bythos_calc_crc16(const uint8_t* data, size_t len) {
     if (data == NULL || len == 0) return 0xFFFF;
-
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; i++) {
-        crc = (crc << 8) ^ crc16_table[((crc >> 8) ^ data[i]) & 0xFF];
+        crc = (uint16_t)((crc << 8) ^ crc16_table[((crc >> 8) ^ data[i]) & 0xFF]);
     }
     return crc;
 }
 
 uint8_t bythos_calc_crc8(const uint8_t* data, size_t len) {
     if (data == NULL || len == 0) return 0x00;
-
     uint8_t crc = 0x00;
     for (size_t i = 0; i < len; i++) {
         crc = crc8_table[crc ^ data[i]];
@@ -153,29 +146,191 @@ uint8_t bythos_calc_crc8(const uint8_t* data, size_t len) {
 }
 
 // ============================================================================
-// ASSINATURA
+// SHA-256 (FIPS 180-4, software puro — produção usa o ATECC608)
 // ============================================================================
 
-uint8_t bythos_signature_compute(uint8_t key, uint8_t msg_id, uint8_t seq_lo, uint8_t seq_hi) {
-    return key ^ msg_id ^ seq_lo ^ seq_hi;
+#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+/** Uma volta de compressão sobre um bloco de 64 bytes. */
+static void sha256_compress(uint32_t s[8], const uint8_t block[64]) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)block[i * 4] << 24) | ((uint32_t)block[i * 4 + 1] << 16) |
+               ((uint32_t)block[i * 4 + 2] << 8) | (uint32_t)block[i * 4 + 3];
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ROTR(w[i - 15], 7) ^ ROTR(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = ROTR(w[i - 2], 17) ^ ROTR(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = s[0], b = s[1], c = s[2], d = s[3];
+    uint32_t e = s[4], f = s[5], g = s[6], h = s[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ROTR(e, 6) ^ ROTR(e, 11) ^ ROTR(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = h + S1 + ch + sha256_k[i] + w[i];
+        uint32_t S0 = ROTR(a, 2) ^ ROTR(a, 13) ^ ROTR(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + maj;
+        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    s[0] += a; s[1] += b; s[2] += c; s[3] += d;
+    s[4] += e; s[5] += f; s[6] += g; s[7] += h;
 }
 
-uint8_t bythos_signature_validate(uint8_t signature, uint8_t key, uint8_t msg_id, uint8_t seq_lo, uint8_t seq_hi) {
-    return (signature == bythos_signature_compute(key, msg_id, seq_lo, seq_hi)) ? 1 : 0;
+/** Núcleo incremental: alimenta `prefixo ‖ corpo` sem os concatenar. */
+static void sha256_two(const uint8_t* pfx, size_t pfx_len,
+                       const uint8_t* body, size_t body_len, uint8_t out[32]) {
+    uint32_t s[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    uint8_t block[64];
+    size_t blen = 0;
+    uint64_t total_bits = 0;
+
+    /* Macro local: absorve uma fatia no bloco, comprimindo quando enche. */
+#define FEED(ptr, n) do { \
+        size_t _off = 0; \
+        total_bits += (uint64_t)(n) * 8; \
+        while (_off < (n)) { \
+            size_t _take = 64 - blen; \
+            if (_take > (n) - _off) _take = (n) - _off; \
+            memcpy(block + blen, (ptr) + _off, _take); \
+            blen += _take; _off += _take; \
+            if (blen == 64) { sha256_compress(s, block); blen = 0; } \
+        } \
+    } while (0)
+
+    FEED(pfx, pfx_len);
+    FEED(body, body_len);
+#undef FEED
+
+    /* Enchimento final: 0x80, zeros, comprimento de 64 bits big-endian. */
+    block[blen++] = 0x80;
+    if (blen > 56) {
+        memset(block + blen, 0, 64 - blen);
+        sha256_compress(s, block);
+        blen = 0;
+    }
+    memset(block + blen, 0, 56 - blen);
+    for (int i = 0; i < 8; i++) {
+        block[56 + i] = (uint8_t)((total_bits >> (56 - 8 * i)) & 0xFF);
+    }
+    sha256_compress(s, block);
+    for (int i = 0; i < 8; i++) {
+        out[i * 4] = (uint8_t)((s[i] >> 24) & 0xFF);
+        out[i * 4 + 1] = (uint8_t)((s[i] >> 16) & 0xFF);
+        out[i * 4 + 2] = (uint8_t)((s[i] >> 8) & 0xFF);
+        out[i * 4 + 3] = (uint8_t)(s[i] & 0xFF);
+    }
+}
+
+void bythos_sha256(const uint8_t* data, size_t len, uint8_t out[32]) {
+    static const uint8_t empty = 0;
+    if (out == NULL) return;
+    if (data == NULL) data = &empty, len = 0;
+    sha256_two(NULL, 0, data, len, out);
+}
+
+void bythos_hmac_sha256(const uint8_t* key, size_t key_len,
+                        const uint8_t* msg, size_t msg_len, uint8_t out[32]) {
+    uint8_t kblk[64] = {0};
+    if (key != NULL && key_len > 0) {
+        if (key_len > 64) {
+            /* Chave longa: condensa primeiro (RFC 2104). */
+            uint8_t d[32];
+            sha256_two(NULL, 0, key, key_len, d);
+            memcpy(kblk, d, 32);
+        } else {
+            memcpy(kblk, key, key_len);
+        }
+    }
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = kblk[i] ^ 0x36;
+        opad[i] = kblk[i] ^ 0x5C;
+    }
+    /* Interno: H(ipad ‖ msg); externo: H(opad ‖ interno). */
+    uint8_t inner[32];
+    uint8_t combo[64 + 1205];
+    static const uint8_t empty = 0;
+    const uint8_t* m = (msg != NULL) ? msg : &empty;
+    size_t ml = (msg != NULL) ? msg_len : 0;
+    /* Sem heap: o interno processa ipad e msg em duas alimentações via cópia
+       para `combo` só se couber; acima de 1205+64 recusa (tramas Bythos cabem). */
+    if (ml > 1205) { memset(out, 0, 32); return; }
+    memcpy(combo, ipad, 64);
+    memcpy(combo + 64, m, ml);
+    sha256_two(NULL, 0, combo, 64 + ml, inner);
+    memcpy(combo, opad, 64);
+    memcpy(combo + 64, inner, 32);
+    sha256_two(NULL, 0, combo, 64 + 32, out);
 }
 
 // ============================================================================
-// FIELDID COM TIPO
+// SELO (TAG — HMAC-SHA256 truncado, com CTR vinculado)
+// ============================================================================
+
+int8_t bythos_tag_compute(const uint8_t key[32], uint32_t ctr,
+                          const uint8_t* covered, size_t covered_len,
+                          uint8_t tag_out[4]) {
+    if (key == NULL || covered == NULL || tag_out == NULL) return -1;
+    if (covered_len > BYTHOS_MAX_MESSAGE_SIZE) return -1;
+    /* O CTR (3 bytes LE) entra como prefixo do HMAC: cada contador tem etiqueta
+       única, logo recortar etiquetas entre tramas não passa. */
+    uint8_t ctr3[3] = {(uint8_t)(ctr & 0xFF), (uint8_t)((ctr >> 8) & 0xFF),
+                       (uint8_t)((ctr >> 16) & 0xFF)};
+    uint8_t msg[3 + BYTHOS_MAX_MESSAGE_SIZE];
+    memcpy(msg, ctr3, 3);
+    memcpy(msg + 3, covered, covered_len);
+    uint8_t full[32];
+    bythos_hmac_sha256(key, 32, msg, 3 + covered_len, full);
+    memcpy(tag_out, full, 4);
+    return 0;
+}
+
+uint8_t bythos_tag_verify(const uint8_t key[32], uint32_t ctr,
+                          const uint8_t* covered, size_t covered_len,
+                          const uint8_t tag[4]) {
+    uint8_t expected[4];
+    if (bythos_tag_compute(key, ctr, covered, covered_len, expected) != 0) return 0;
+    /* Tempo constante: compara os 4 bytes sempre. */
+    uint8_t diff = 0;
+    for (int i = 0; i < 4; i++) diff |= (uint8_t)(expected[i] ^ tag[i]);
+    return (diff == 0) ? 1 : 0;
+}
+
+uint8_t bythos_legacy_tag_compute(uint8_t key, uint8_t msg_id, uint8_t seq_lo, uint8_t seq_hi) {
+    return (uint8_t)(key ^ msg_id ^ seq_lo ^ seq_hi);
+}
+
+uint8_t bythos_legacy_tag_validate(uint8_t tag, uint8_t key, uint8_t msg_id,
+                                   uint8_t seq_lo, uint8_t seq_hi) {
+    return (tag == bythos_legacy_tag_compute(key, msg_id, seq_lo, seq_hi)) ? 1 : 0;
+}
+
+// ============================================================================
+// IDENTIFICADOR DE CAMPO
 // ============================================================================
 
 uint8_t bythos_field_id_encode(uint8_t field_type, uint8_t field_id) {
     if (field_type > 7 || field_id > 31) return 0xFF;
-    return (field_type << 5) | (field_id & 0x1F);
+    return (uint8_t)((field_type << 5) | (field_id & 0x1F));
 }
 
 void bythos_field_id_decode(uint8_t field_id, uint8_t* type_out, uint8_t* id_out) {
     if (type_out == NULL || id_out == NULL) return;
-    *type_out = (field_id >> 5) & 0x07;
+    *type_out = (uint8_t)((field_id >> 5) & 0x07);
     *id_out = field_id & 0x1F;
 }
 
@@ -184,286 +339,376 @@ uint8_t bythos_field_id_valid(uint8_t field_id) {
 }
 
 // ============================================================================
-// CAN ID
+// IDENTIFICADOR DO BYTHOS BUS (arbitragem estilo CAN, nomes Bythos)
 // ============================================================================
 
-/**
- * Constrói um CAN ID extended (29-bit) a partir dos seus componentes.
- *
- * Formato do CAN ID:
- *   Bits 28-26: Prioridade (3 bits, 0-4)
- *   Bits 25-22: Grupo de origem (4 bits, 0x0-0xF)
- *   Bits 21-18: Grupo de destino (4 bits, 0x0-0xF)
- *   Bits 17-14: Tipo de mensagem (4 bits, 0x0-0x7)
- *   Bits 13-0:  Reservado (14 bits)
- *
- * @param priority   Nível de prioridade (0-4)
- * @param src_group  Grupo de origem (0x0-0xF)
- * @param dst_group  Grupo de destino (0x0=broadcast)
- * @param msg_type   Tipo de mensagem (0x0-0x7)
- * @return           CAN ID de 29 bits
- */
-uint32_t bythos_can_id_make(uint8_t priority, uint8_t src_group, uint8_t dst_group, uint8_t msg_type) {
-    if (priority > 4 || src_group > 0xF || dst_group > 0xF || msg_type > 0x7) {
-        return 0;
+uint32_t bythos_bus_id_make(uint8_t priority, uint8_t group, uint8_t kind, uint16_t src) {
+    /* Validação estrita (comissionamento): recusar em vez de mascarar, para
+       dois nós nunca colidirem por erro de configuração. */
+    if (priority > BYTHOS_PRIORITY_LOW || group > 0x0F) return 0;
+    if (kind > BYTHOS_KIND_RING) return 0;
+    return ((uint32_t)priority << 29) | ((uint32_t)group << 25) |
+           (((uint32_t)kind & 0x0F) << 21) | ((uint32_t)src << 5);
+}
+
+uint8_t bythos_bus_id_priority(uint32_t id) {
+    return (uint8_t)((id >> 29) & 0x07);
+}
+
+uint8_t bythos_bus_id_group(uint32_t id) {
+    return (uint8_t)((id >> 25) & 0x0F);
+}
+
+uint8_t bythos_bus_id_kind(uint32_t id) {
+    return (uint8_t)((id >> 21) & 0x0F);
+}
+
+uint16_t bythos_bus_id_src(uint32_t id) {
+    return (uint16_t)((id >> 5) & 0xFFFF);
+}
+
+uint8_t bythos_bus_id_wins(uint32_t a, uint32_t b) {
+    return (a < b) ? 1 : 0;
+}
+
+// ============================================================================
+// ENDEREÇAMENTO (sem CAN ID na V4)
+// ============================================================================
+
+uint8_t bythos_kind_of(uint8_t msg_id) {
+    switch (msg_id) {
+        case 0x10: return BYTHOS_KIND_HEART;
+        case 0x11: return BYTHOS_KIND_DATA;
+        case 0x12: return BYTHOS_KIND_CMD;
+        case 0x13: return BYTHOS_KIND_ACK;
+        case 0x14: return BYTHOS_KIND_SAFETY;
+        case 0x15: return BYTHOS_KIND_DATA;
+        case 0x16: return BYTHOS_KIND_DATA;
+        case 0x17: return BYTHOS_KIND_CMD;
+        case 0x18: return BYTHOS_KIND_DATA;
+        case 0x19: return BYTHOS_KIND_HEART;
+        case 0x1A: return BYTHOS_KIND_SYNC;
+        case 0x1B: return BYTHOS_KIND_SYNC;
+        case 0x1C: case 0x1D: case 0x1E: case 0x1F: return BYTHOS_KIND_RING;
+        default: return 0xFF;
     }
-    return ((uint32_t)priority << 26) | ((uint32_t)src_group << 22) |
-           ((uint32_t)dst_group << 18) | (((uint32_t)msg_type & 0x0F) << 14);
+}
+
+uint8_t bythos_group_valid(uint8_t group) {
+    return (group <= 0x0F) ? 1 : 0;
+}
+
+uint8_t bythos_is_safety_kind(uint8_t kind) {
+    return (kind == BYTHOS_KIND_SAFETY) ? 1 : 0;
 }
 
 /**
- * Extrai a prioridade de um CAN ID extended.
- * Bits 28-26 → valor 0-4
+ * Sentido no anel: 0 = AFTER (frente, números crescentes), 1 = BEFORE (trás),
+ * 2 = local (difusão, próprio ou sem geografia).
  */
-uint8_t bythos_can_id_priority(uint32_t can_id) {
-    return (can_id >> 26) & 0x07;
-}
-
-/**
- * Extrai o grupo de origem de um CAN ID extended.
- * Bits 25-22 → valor 0x0-0xF
- */
-uint8_t bythos_can_id_src(uint32_t can_id) {
-    return (can_id >> 22) & 0x0F;
-}
-
-/**
- * Extrai o grupo de destino de um CAN ID extended.
- * Bits 21-18 → valor 0x0-0xF
- */
-uint8_t bythos_can_id_dst(uint32_t can_id) {
-    return (can_id >> 18) & 0x0F;
-}
-
-/**
- * Extrai o tipo de mensagem de um CAN ID extended.
- * Bits 17-14 → valor 0x0-0x7
- */
-uint8_t bythos_can_id_type(uint32_t can_id) {
-    return (can_id >> 14) & 0x0F;
-}
-
-/**
- * Verifica se o CAN ID pertence ao bus de segurança (msg_type == Safety = 0x7).
- */
-uint8_t bythos_is_safety_bus(uint32_t can_id) {
-    return (bythos_can_id_type(can_id) == BYTHOS_CAN_SAFETY) ? 1 : 0;
+uint8_t bythos_ring_decide(uint16_t me, uint16_t total, uint16_t dst) {
+    if (dst == BYTHOS_BROADCAST || dst == me || total == 0) return 2;
+    uint32_t t = total;
+    uint32_t cw = ((uint32_t)dst + t - me) % t;
+    uint32_t ccw = ((uint32_t)me + t - dst) % t;
+    return (cw <= ccw) ? 0 : 1;
 }
 
 // ============================================================================
-// SERIALIZAÇÃO
+// CONSTRUÇÃO
 // ============================================================================
 
-bythos_ssize_t bythos_build(const BythosMessage* msg, uint8_t msg_id, uint8_t signature_key,
-                           uint8_t* buffer, size_t buffer_size) {
-    if (msg == NULL || buffer == NULL) return -1;
+bythos_ssize_t bythos_build(const BythosMessage* msg, uint8_t msg_id, uint16_t dst,
+                            uint8_t key_id, uint32_t ctr, const uint8_t key[32],
+                            uint8_t* buffer, size_t buffer_size) {
+    if (msg == NULL || buffer == NULL || key == NULL) return -1;
     if (!is_valid_msg_id(msg_id)) return -1;
     if (buffer_size < BYTHOS_OVERHEAD) return -1;
+    if (msg->field_count > BYTHOS_MAX_FIELDS) return -1;
 
-    size_t offset = 0;
+    /* Mede os campos primeiro — `len` de struct C não-confiável valida-se aqui
+       (na V3 lia-se `memcpy` direto: OOB em leitura e escrita). */
+    size_t fields_size = 0;
+    int video_big_seen = 0;
+    for (uint8_t i = 0; i < msg->field_count; i++) {
+        uint8_t len = msg->fields[i].len;
+        if (len > BYTHOS_MAX_VIDEO_DATA) return -1;
+        if (len > BYTHOS_MAX_FIELD_DATA) {
+            uint8_t ftype = (msg->fields[i].id >> 5) & 0x07;
+            if (ftype != BYTHOS_FIELD_RAW || msg->fields[i].id != BYTHOS_FIELD_VIDEO_PAYLOAD ||
+                video_big_seen) return -1;
+            video_big_seen = 1;
+        }
+        fields_size += BYTHOS_FIELD_HEADER_SIZE + len;
+    }
+    size_t required = BYTHOS_HEADER_SIZE + fields_size + BYTHOS_SEC_HDR_SIZE +
+                      BYTHOS_TAG_SIZE + BYTHOS_CRC16_SIZE;
+    if (required > BYTHOS_MAX_MESSAGE_SIZE || buffer_size < required) return -1;
 
-    // --- Cabeçalho Bythos (7 bytes) ---
-    buffer[offset++] = BYTHOS_START_BYTE;
-    buffer[offset++] = BYTHOS_VERSION;
-    buffer[offset++] = msg->node_id;
-    buffer[offset++] = msg_id;
+    size_t off = 0;
+    buffer[off++] = BYTHOS_START_BYTE;
+    buffer[off++] = BYTHOS_VERSION;
+    buffer[off++] = (uint8_t)(msg->src & 0xFF);
+    buffer[off++] = (uint8_t)((msg->src >> 8) & 0xFF);
+    buffer[off++] = (uint8_t)(dst & 0xFF);
+    buffer[off++] = (uint8_t)((dst >> 8) & 0xFF);
+    buffer[off++] = msg_id;
+    buffer[off++] = (uint8_t)(msg->seq_num & 0xFF);
+    buffer[off++] = (uint8_t)((msg->seq_num >> 8) & 0xFF);
+    buffer[off++] = msg->field_count;
+    buffer[off++] = msg->hops;
 
-    // SEQ_NUM (2 bytes, little-endian)
-    buffer[offset++] = (uint8_t)(msg->seq_num & 0xFF);
-    buffer[offset++] = (uint8_t)((msg->seq_num >> 8) & 0xFF);
-
-    buffer[offset++] = msg->tlv_count;
-
-    // --- Campos TLV ---
-    for (uint8_t i = 0; i < msg->tlv_count && i < BYTHOS_MAX_TLV_FIELDS; i++) {
-        const BythosTLVField* tlv = &msg->tlvs[i];
-        if (offset + 2 + tlv->len > buffer_size) return -1;
-        buffer[offset++] = tlv->id;
-        buffer[offset++] = tlv->len;
-        memcpy(&buffer[offset], tlv->data, tlv->len);
-        offset += tlv->len;
+    for (uint8_t i = 0; i < msg->field_count; i++) {
+        uint8_t len = msg->fields[i].len;
+        buffer[off++] = msg->fields[i].id;
+        buffer[off++] = len;
+        memcpy(&buffer[off], msg->fields[i].data, len);
+        off += len;
     }
 
-    // --- Assinatura ---
-    uint8_t signature = bythos_signature_compute(
-        signature_key, msg_id,
-        (uint8_t)(msg->seq_num & 0xFF),
-        (uint8_t)((msg->seq_num >> 8) & 0xFF)
-    );
-    buffer[offset++] = signature;
+    uint32_t ctr24 = ctr & 0xFFFFFF;
+    buffer[off++] = key_id;
+    buffer[off++] = (uint8_t)(ctr24 & 0xFF);
+    buffer[off++] = (uint8_t)((ctr24 >> 8) & 0xFF);
+    buffer[off++] = (uint8_t)((ctr24 >> 16) & 0xFF);
 
-    // --- CRC16 ---
-    uint16_t crc = bythos_calc_crc16(buffer, offset);
-    buffer[offset++] = (uint8_t)(crc & 0xFF);
-    buffer[offset++] = (uint8_t)((crc >> 8) & 0xFF);
+    uint8_t tag[4];
+    if (bythos_tag_compute(key, ctr24, buffer, off, tag) != 0) return -1;
+    memcpy(&buffer[off], tag, 4);
+    off += 4;
 
-    return (bythos_ssize_t)offset;
+    uint16_t crc = bythos_calc_crc16(buffer, off);
+    buffer[off++] = (uint8_t)(crc & 0xFF);
+    buffer[off++] = (uint8_t)((crc >> 8) & 0xFF);
+
+    return (bythos_ssize_t)off;
 }
 
+// ============================================================================
+// VALIDAÇÃO
+// ============================================================================
+
 /**
- * Valida uma mensagem Bythos completa num buffer.
- *
- * Verifica: byte de início, versão, msg_id, tlv_count,
- * integridade dos campos TLV (bounds e tamanhos) e CRC16.
- * Alinhado com a implementação Rust validate_message().
- *
- * @param buffer  Buffer contendo a mensagem
- * @param length  Tamanho do buffer
- * @return        tlv_count se válido, 0xFF em erro
+ * Estrutura + CRC, sem chaves (para encaminhar). Devolve nº de campos ou 0xFF.
+ * Exige comprimento exato: bytes a mais ou a menos = malformada.
  */
-uint8_t bythos_validate(const uint8_t* buffer, size_t length) {
+uint8_t bythos_peek(const uint8_t* buffer, size_t length) {
     if (buffer == NULL || length < BYTHOS_OVERHEAD) return 0xFF;
-
-    // Validar byte de início
     if (buffer[0] != BYTHOS_START_BYTE) return 0xFF;
-
-    // Validar versão
     if (buffer[1] != BYTHOS_VERSION) return 0xFF;
+    if (!is_valid_msg_id(buffer[6])) return 0xFF;
+    uint8_t count = buffer[9];
+    if (count > BYTHOS_MAX_FIELDS) return 0xFF;
 
-    // Validar msg_id
-    if (!is_valid_msg_id(buffer[3])) return 0xFF;
-
-    // Validar tlv_count
-    uint8_t tlv_count = buffer[6];
-    if (tlv_count > BYTHOS_MAX_TLV_FIELDS) return 0xFF;
-
-    // Percorrer campos TLV validando bounds
-    size_t offset = BYTHOS_HEADER_SIZE;
-    for (uint8_t i = 0; i < tlv_count; i++) {
-        if (offset + BYTHOS_TLV_HEADER_SIZE > length) return 0xFF;
-        uint8_t field_len = buffer[offset + 1];
-        if (field_len > BYTHOS_MAX_TLV_DATA) return 0xFF;
-        offset += BYTHOS_TLV_HEADER_SIZE + field_len;
+    size_t off = BYTHOS_HEADER_SIZE;
+    int video_big_seen = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        if (off + BYTHOS_FIELD_HEADER_SIZE > length) return 0xFF;
+        uint8_t fid = buffer[off];
+        uint8_t flen = buffer[off + 1];
+        if (flen > BYTHOS_MAX_VIDEO_DATA) return 0xFF;
+        if (flen > BYTHOS_MAX_FIELD_DATA) {
+            uint8_t ftype = (fid >> 5) & 0x07;
+            if (ftype != BYTHOS_FIELD_RAW || fid != BYTHOS_FIELD_VIDEO_PAYLOAD ||
+                video_big_seen) return 0xFF;
+            video_big_seen = 1;
+        }
+        off += BYTHOS_FIELD_HEADER_SIZE + flen;
     }
+    if (off + BYTHOS_SEC_HDR_SIZE + BYTHOS_TAG_SIZE + BYTHOS_CRC16_SIZE != length) return 0xFF;
 
-    // Validar CRC16 (últimos 2 bytes)
-    size_t crc_offset = length - BYTHOS_CRC16_SIZE;
-    uint16_t received_crc = (uint16_t)buffer[crc_offset] | ((uint16_t)buffer[crc_offset + 1] << 8);
-    uint16_t computed_crc = bythos_calc_crc16(buffer, crc_offset);
-    if (received_crc != computed_crc) return 0xFF;
+    size_t crc_at = length - BYTHOS_CRC16_SIZE;
+    uint16_t rx = (uint16_t)buffer[crc_at] | ((uint16_t)buffer[crc_at + 1] << 8);
+    if (bythos_calc_crc16(buffer, crc_at) != rx) return 0xFF;
+    return count;
+}
 
-    return tlv_count;
+void bythos_peers_clear(BythosPeers* peers) {
+    if (peers == NULL) return;
+    memset(peers, 0, sizeof(BythosPeers));
+}
+
+/** Janela anti-replay de uma ranhura (espelha o Rust, aritmética circular). */
+static int peers_accept(BythosPeers* p, int slot, uint32_t ctr) {
+    ctr &= 0xFFFFFF;
+    if (!p->seen[slot]) {
+        p->last[slot] = ctr;
+        p->mask[slot] = 1;
+        p->seen[slot] = 1;
+        return 1;
+    }
+    uint32_t last = p->last[slot] & 0xFFFFFF;
+    uint32_t fwd = (ctr - last) & 0xFFFFFF;
+    if (fwd == 0) return 0;
+    if (fwd < (1u << 23)) {
+        /* Para a frente: avança (corta o que cai fora dos 64). */
+        p->mask[slot] = (fwd >= 64) ? 1 : ((p->mask[slot] << fwd) | 1);
+        p->last[slot] = ctr;
+        return 1;
+    }
+    uint32_t back = (last - ctr) & 0xFFFFFF;
+    if (back == 0 || back > 64) return 0;
+    uint64_t bit = 1ULL << back;
+    if (p->mask[slot] & bit) return 0;
+    p->mask[slot] |= bit;
+    return 1;
 }
 
 /**
- * Valida a assinatura de uma mensagem Bythos.
- * Primeiro valida CRC16 e estrutura, depois verifica a assinatura HMAC.
- *
- * @param buffer         Buffer contendo a mensagem
- * @param length         Tamanho do buffer
- * @param signature_key  Chave de assinatura
- * @return               1 se válida, 0 caso contrário
+ * Ponta-a-ponta: estrutura + CRC + TAG + replay. Nº de campos ou 0xFF.
+ * O CTR só entra na janela depois do TAG válido (aceitar CTR de trama forjada
+ * envenenaria a janela e faria DoS às tramas boas seguintes).
  */
-uint8_t bythos_validate_signature(const uint8_t* buffer, size_t length, uint8_t signature_key) {
-    if (buffer == NULL || length < BYTHOS_OVERHEAD) return 0;
+uint8_t bythos_validate(const uint8_t* buffer, size_t length,
+                        const uint8_t key[32], BythosPeers* peers) {
+    if (buffer == NULL || key == NULL || peers == NULL) return 0xFF;
+    uint8_t count = bythos_peek(buffer, length);
+    if (count == 0xFF) return 0xFF;
 
-    // Validar CRC primeiro
-    if (bythos_validate(buffer, length) == 0xFF) return 0;
+    uint16_t src = (uint16_t)buffer[2] | ((uint16_t)buffer[3] << 8);
+    size_t fields_end = length - BYTHOS_SEC_HDR_SIZE - BYTHOS_TAG_SIZE - BYTHOS_CRC16_SIZE;
+    uint8_t key_id = buffer[fields_end];
+    if (key_id == BYTHOS_KEY_ID_LEGACY) return 0xFF; /* Sem TAG não há o que verificar. */
+    if (src == BYTHOS_BROADCAST) return 0xFF;        /* Difusão não é emissor. */
+    uint32_t ctr = (uint32_t)buffer[fields_end + 1] |
+                   ((uint32_t)buffer[fields_end + 2] << 8) |
+                   ((uint32_t)buffer[fields_end + 3] << 16);
+    size_t tag_at = fields_end + BYTHOS_SEC_HDR_SIZE;
+    if (!bythos_tag_verify(key, ctr, buffer, fields_end + BYTHOS_SEC_HDR_SIZE, &buffer[tag_at]))
+        return 0xFF;
 
-    size_t sig_offset = length - BYTHOS_CRC16_SIZE - BYTHOS_SIGNATURE_SIZE;
-    uint8_t signature = buffer[sig_offset];
-    uint8_t msg_id = buffer[3];
-    uint8_t seq_lo = buffer[4];
-    uint8_t seq_hi = buffer[5];
-
-    return bythos_signature_validate(signature, signature_key, msg_id, seq_lo, seq_hi);
+    /* Procura a ranhura (src, key_id); nova ocupa vazia ou despeja a mais velha. */
+    int slot = -1;
+    for (int i = 0; i < 8; i++) {
+        if (peers->used[i] && peers->src[i] == src && peers->key_id[i] == key_id) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        int victim = -1;
+        uint32_t oldest = 0xFFFFFFFF;
+        for (int i = 0; i < 8; i++) {
+            if (!peers->used[i]) { victim = i; break; }
+            if (peers->stamps[i] < oldest) { oldest = peers->stamps[i]; victim = i; }
+        }
+        slot = victim;
+        peers->src[slot] = src;
+        peers->key_id[slot] = key_id;
+        peers->last[slot] = 0;
+        peers->mask[slot] = 0;
+        peers->seen[slot] = 0;
+        peers->used[slot] = 1;
+    }
+    peers->tick++;
+    peers->stamps[slot] = peers->tick;
+    if (!peers_accept(peers, slot, ctr)) return 0xFF;
+    return count;
 }
 
-void bythos_parse_tlv(const uint8_t* data, size_t length, BythosTLVField* output, size_t* count) {
+void bythos_parse_fields(const uint8_t* data, size_t length,
+                         BythosField* output, size_t* count) {
     if (data == NULL || output == NULL || count == NULL) return;
-
     size_t capacity = *count;
-    size_t offset = 0;
-    size_t parsed = 0;
-
-    while (offset + BYTHOS_TLV_HEADER_SIZE <= length && parsed < capacity) {
-        uint8_t id = data[offset++];
-        uint8_t len = data[offset++];
-
-        if (!is_valid_field_id(id)) break;
-        if (len > BYTHOS_MAX_TLV_DATA) break;
-        if (offset + len > length) break;
-
+    size_t off = 0, parsed = 0;
+    /* Tamanhos canónicos por tipo (raw = livre até 32; vídeo raw até 128). */
+    static const uint8_t canon[8] = {0, 4, 2, 4, 4, 2, 1, 1};
+    while (off + BYTHOS_FIELD_HEADER_SIZE <= length && parsed < capacity) {
+        uint8_t id = data[off];
+        uint8_t len = data[off + 1];
+        uint8_t ftype = (id >> 5) & 0x07;
+        int ok;
+        if (ftype == BYTHOS_FIELD_RAW) {
+            ok = (len <= BYTHOS_MAX_FIELD_DATA) ||
+                 (id == BYTHOS_FIELD_VIDEO_PAYLOAD && len <= BYTHOS_MAX_VIDEO_DATA);
+        } else {
+            ok = (len == canon[ftype]);
+        }
+        if (!ok) break;
+        if (off + BYTHOS_FIELD_HEADER_SIZE + len > length) break;
+        if (len > BYTHOS_MAX_FIELD_DATA) break; /* Não cabe em BythosField. */
         output[parsed].id = id;
         output[parsed].len = len;
-        memcpy(output[parsed].data, &data[offset], len);
-        offset += len;
+        memcpy(output[parsed].data, &data[off + BYTHOS_FIELD_HEADER_SIZE], len);
+        off += BYTHOS_FIELD_HEADER_SIZE + len;
         parsed++;
     }
-
     *count = parsed;
 }
 
 // ============================================================================
-// ADICIONAR CAMPOS TLV
+// CAMPOS
 // ============================================================================
 
-int8_t bythos_tlv_add(BythosMessage* msg, uint8_t id, const uint8_t* data, uint8_t len) {
+int8_t bythos_field_add(BythosMessage* msg, uint8_t id, const uint8_t* data, uint8_t len) {
     if (msg == NULL || data == NULL) return -1;
     if (!is_valid_field_id(id)) return -1;
-    if (len > BYTHOS_MAX_TLV_DATA) return -1;
-    if (msg->tlv_count >= BYTHOS_MAX_TLV_FIELDS) return -1;
-
-    BythosTLVField* tlv = &msg->tlvs[msg->tlv_count];
-    tlv->id = id;
-    tlv->len = len;
-    memcpy(tlv->data, data, len);
-    msg->tlv_count++;
+    if (len > BYTHOS_MAX_FIELD_DATA) return -1;
+    if (msg->field_count >= BYTHOS_MAX_FIELDS) return -1;
+    BythosField* f = &msg->fields[msg->field_count];
+    f->id = id;
+    f->len = len;
+    memcpy(f->data, data, len);
+    msg->field_count++;
     return 0;
 }
 
-int8_t bythos_tlv_add_f32(BythosMessage* msg, uint8_t id, float value) {
-    uint8_t bytes[4];
-    bythos_f32_to_bytes(value, bytes);
-    return bythos_tlv_add(msg, id, bytes, 4);
+int8_t bythos_field_add_f32(BythosMessage* msg, uint8_t id, float value) {
+    uint8_t b[4];
+    bythos_f32_to_bytes(value, b);
+    return bythos_field_add(msg, id, b, 4);
 }
 
-int8_t bythos_tlv_add_i32(BythosMessage* msg, uint8_t id, int32_t value) {
-    uint8_t bytes[4];
-    bythos_i32_to_bytes(value, bytes);
-    return bythos_tlv_add(msg, id, bytes, 4);
+int8_t bythos_field_add_f16(BythosMessage* msg, uint8_t id, float value) {
+    uint16_t h = bythos_f32_to_f16(value);
+    uint8_t b[2] = {(uint8_t)(h & 0xFF), (uint8_t)((h >> 8) & 0xFF)};
+    return bythos_field_add(msg, id, b, 2);
 }
 
-int8_t bythos_tlv_add_u32(BythosMessage* msg, uint8_t id, uint32_t value) {
-    uint8_t bytes[4];
-    bythos_u32_to_bytes(value, bytes);
-    return bythos_tlv_add(msg, id, bytes, 4);
+int8_t bythos_field_add_i32(BythosMessage* msg, uint8_t id, int32_t value) {
+    uint8_t b[4];
+    bythos_i32_to_bytes(value, b);
+    return bythos_field_add(msg, id, b, 4);
 }
 
-int8_t bythos_tlv_add_u16(BythosMessage* msg, uint8_t id, uint16_t value) {
-    uint8_t bytes[2];
-    bythos_u16_to_bytes(value, bytes);
-    return bythos_tlv_add(msg, id, bytes, 2);
+int8_t bythos_field_add_u32(BythosMessage* msg, uint8_t id, uint32_t value) {
+    uint8_t b[4];
+    bythos_u32_to_bytes(value, b);
+    return bythos_field_add(msg, id, b, 4);
 }
 
-int8_t bythos_tlv_add_u8(BythosMessage* msg, uint8_t id, uint8_t value) {
-    return bythos_tlv_add(msg, id, &value, 1);
+int8_t bythos_field_add_u16(BythosMessage* msg, uint8_t id, uint16_t value) {
+    uint8_t b[2];
+    bythos_u16_to_bytes(value, b);
+    return bythos_field_add(msg, id, b, 2);
+}
+
+int8_t bythos_field_add_u8(BythosMessage* msg, uint8_t id, uint8_t value) {
+    return bythos_field_add(msg, id, &value, 1);
+}
+
+int8_t bythos_field_add_bool(BythosMessage* msg, uint8_t id, uint8_t value) {
+    uint8_t b = (value != 0) ? 1 : 0;
+    return bythos_field_add(msg, id, &b, 1);
 }
 
 // ============================================================================
-// INICIALIZAÇÃO DE MENSAGEM
+// INICIALIZAÇÃO
 // ============================================================================
 
-/**
- * Inicializa uma estrutura BythosMessage com os valores por omissão.
- * Zera toda a estrutura antes de definir os campos para evitar dados residuais.
- *
- * @param msg     Apontador para a estrutura a inicializar
- * @param node_id ID do nó (0x0-0xF)
- * @param msg_id  ID da mensagem (0x10-0x1B)
- */
-void bythos_init(BythosMessage* msg, uint8_t node_id, uint8_t msg_id) {
+void bythos_init(BythosMessage* msg, uint16_t src, uint8_t msg_id) {
     if (msg == NULL) return;
-    if (node_id > 0xF) return;
     if (!is_valid_msg_id(msg_id)) return;
-
-    // Zerar toda a estrutura para evitar dados residuais
-    memset(msg, 0, sizeof(BythosMessage));
-
-    msg->start_byte = BYTHOS_START_BYTE;
-    msg->version = BYTHOS_VERSION;
-    msg->node_id = node_id;
+    /* Campo a campo (não memset puro): o preâmbulo fica correto e `fields`
+       fica válido — ver divergência V3 na migração. */
+    bythos_clear(msg);
+    msg->src = src;
     msg->msg_id = msg_id;
+}
+
+void bythos_set_dst(BythosMessage* msg, uint16_t dst) {
+    if (msg == NULL) return;
+    msg->dst = dst;
 }
 
 void bythos_set_seq(BythosMessage* msg, uint16_t seq) {
@@ -471,27 +716,79 @@ void bythos_set_seq(BythosMessage* msg, uint16_t seq) {
     msg->seq_num = seq;
 }
 
+void bythos_set_hops(BythosMessage* msg, uint8_t hops) {
+    if (msg == NULL) return;
+    msg->hops = hops;
+}
+
 void bythos_clear(BythosMessage* msg) {
     if (msg == NULL) return;
     memset(msg, 0, sizeof(BythosMessage));
+    msg->start_byte = BYTHOS_START_BYTE;
+    msg->version = BYTHOS_VERSION;
+    msg->dst = BYTHOS_BROADCAST;
+    msg->hops = BYTHOS_HOPS_DEFAULT;
 }
 
 // ============================================================================
-// CONVERSÃO DE BYTES
+// CONVERSÕES (little-endian; float via memcpy, nunca union)
 // ============================================================================
 
 void bythos_f32_to_bytes(float value, uint8_t* bytes) {
     if (bytes == NULL) return;
-    // memcpy evita type-punning via union (undefined behavior em C)
     memcpy(bytes, &value, sizeof(float));
 }
 
 float bythos_bytes_to_f32(const uint8_t* bytes) {
     if (bytes == NULL) return 0.0f;
-    // memcpy evita type-punning via union (undefined behavior em C)
-    float result;
-    memcpy(&result, bytes, sizeof(float));
-    return result;
+    float r;
+    memcpy(&r, bytes, sizeof(float));
+    return r;
+}
+
+/** f32 → f16 (bits): rebasa o expoente 127→15, satura em infinito. */
+uint16_t bythos_f32_to_f16(float value) {
+    uint32_t b;
+    memcpy(&b, &value, 4);
+    uint16_t sign = (uint16_t)((b >> 31) & 0x1);
+    int32_t exp = (int32_t)((b >> 23) & 0xFF) - 127;
+    uint32_t mant = b & 0x7FFFFF;
+    if (exp > 15) return (uint16_t)((sign << 15) | (0x1F << 10));
+    if (exp < -24) return (uint16_t)(sign << 15);
+    if (exp < -14) {
+        uint32_t shift = (uint32_t)(-exp - 14);
+        uint32_t m = (mant | 0x800000) >> (shift + 13);
+        return (uint16_t)((sign << 15) | m);
+    }
+    uint16_t m = (uint16_t)((mant + 0x1000) >> 13);
+    int32_t e = exp + 15;
+    if (m == 0x400) return (uint16_t)((sign << 15) | ((e + 1) << 10));
+    return (uint16_t)((sign << 15) | (e << 10) | (m & 0x3FF));
+}
+
+/** f16 (bits) → f32: rebasa 15→127, preserva subnormais/NaN. */
+float bythos_f16_to_f32(uint16_t h) {
+    uint32_t sign = ((uint32_t)h >> 15) & 0x1;
+    int32_t exp = (((uint32_t)h >> 10) & 0x1F);
+    uint32_t mant = h & 0x3FF;
+    uint32_t b;
+    if (exp == 0) {
+        if (mant == 0) {
+            b = sign << 31;
+        } else {
+            int32_t e = -14;
+            while ((mant & 0x400) == 0) { mant <<= 1; e--; }
+            mant &= 0x3FF;
+            b = (sign << 31) | ((uint32_t)(e + 127) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        b = (sign << 31) | (0xFFu << 23) | (mant << 13);
+    } else {
+        b = (sign << 31) | ((uint32_t)(exp + 112) << 23) | (mant << 13);
+    }
+    float r;
+    memcpy(&r, &b, 4);
+    return r;
 }
 
 void bythos_i32_to_bytes(int32_t value, uint8_t* bytes) {
@@ -530,37 +827,24 @@ void bythos_u16_to_bytes(uint16_t value, uint8_t* bytes) {
 
 uint16_t bythos_bytes_to_u16(const uint8_t* bytes) {
     if (bytes == NULL) return 0;
-    return (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+    return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
 // ============================================================================
-// VALIDAÇÃO
+// DIVERSOS
 // ============================================================================
 
 uint8_t bythos_msg_id_valid(uint8_t id) {
     return is_valid_msg_id(id) ? 1 : 0;
 }
 
-/**
- * Retorna a prioridade de uma mensagem com base no seu ID e estado de failsafe.
- *
- * Alinhado com a implementação Rust: quando failsafe está ativo, todas as
- * mensagens (exceto Debug) recebem prioridade SUPER_CRITICAL.
- *
- * @param msg_id          ID da mensagem (0x10-0x1B)
- * @param failsafe_active 1 se failsafe ativo, 0 caso contrário
- * @return                Nível de prioridade (0=SuperCritical..4=Low)
- */
 uint8_t bythos_msg_priority(uint8_t msg_id, uint8_t failsafe_active) {
+    /* Tipo inválido = Low (unificado com o núcleo; a V3 divergia aqui). */
     if (!is_valid_msg_id(msg_id)) return BYTHOS_PRIORITY_LOW;
-
-    // Quando failsafe ativo: Debug=LOW, todos os outros=SUPER_CRITICAL
     if (failsafe_active) {
         if (msg_id == BYTHOS_MSG_DEBUG) return BYTHOS_PRIORITY_LOW;
         return BYTHOS_PRIORITY_SUPER_CRITICAL;
     }
-
-    // Prioridade padrão por tipo de mensagem
     switch (msg_id) {
         case BYTHOS_MSG_HEARTBEAT:  return BYTHOS_PRIORITY_MEDIUM;
         case BYTHOS_MSG_TELEMETRY:  return BYTHOS_PRIORITY_MEDIUM;
@@ -574,16 +858,16 @@ uint8_t bythos_msg_priority(uint8_t msg_id, uint8_t failsafe_active) {
         case BYTHOS_MSG_WATCHDOG:   return BYTHOS_PRIORITY_MEDIUM;
         case BYTHOS_MSG_PING:       return BYTHOS_PRIORITY_MEDIUM;
         case BYTHOS_MSG_CLOCK:      return BYTHOS_PRIORITY_HIGH;
+        case BYTHOS_MSG_HELLO:      return BYTHOS_PRIORITY_HIGH;
+        case BYTHOS_MSG_COUNT:      return BYTHOS_PRIORITY_HIGH;
+        case BYTHOS_MSG_RING_OPEN:  return BYTHOS_PRIORITY_HIGH;
+        case BYTHOS_MSG_WIRING_FAULT: return BYTHOS_PRIORITY_HIGH;
         default:                    return BYTHOS_PRIORITY_LOW;
     }
 }
 
-// ============================================================================
-// UTILITÁRIOS
-// ============================================================================
-
 const char* bythos_version(void) {
-    return "3.0.0";
+    return "4.0.0";
 }
 
 size_t bythos_overhead(void) {
@@ -592,4 +876,60 @@ size_t bythos_overhead(void) {
 
 size_t bythos_max_message_size(void) {
     return BYTHOS_MAX_MESSAGE_SIZE;
+}
+
+// ============================================================================
+// COBS (tubo opaco para rádios — sem zeros na saída)
+// ============================================================================
+
+bythos_ssize_t bythos_cobs_encode(const uint8_t* data, size_t len,
+                                 uint8_t* output, size_t out_size) {
+    if (data == NULL || output == NULL || out_size < 2) return -1;
+    size_t read = 0, write = 1, code_at = 0;
+    uint8_t code = 1;
+    output[0] = 0; /* Reserva a distância do primeiro bloco. */
+    while (read < len) {
+        if (data[read] == 0) {
+            if (write >= out_size) return -1;
+            output[code_at] = code;
+            code_at = write++;
+            code = 1;
+            read++;
+        } else {
+            if (write >= out_size) return -1;
+            output[write++] = data[read++];
+            code++;
+            if (code == 0xFF) {
+                if (write >= out_size) return -1;
+                output[code_at] = code;
+                code_at = write++;
+                code = 1;
+            }
+        }
+    }
+    output[code_at] = code;
+    return (bythos_ssize_t)write;
+}
+
+bythos_ssize_t bythos_cobs_decode(const uint8_t* data, size_t len,
+                                 uint8_t* output, size_t out_size) {
+    if (data == NULL || output == NULL) return -1;
+    size_t read = 0, write = 0;
+    while (read < len) {
+        uint8_t code = data[read++];
+        if (code == 0) return -1;
+        size_t span = code - 1;
+        if (read + span > len || write + span > out_size) return -1;
+        for (size_t i = 0; i < span; i++) {
+            if (data[read + i] == 0) return -1; /* Zero em COBS = corrupção. */
+        }
+        memcpy(output + write, data + read, span);
+        read += span;
+        write += span;
+        if (code < 0xFF && read < len) {
+            if (write >= out_size) return -1;
+            output[write++] = 0;
+        }
+    }
+    return (bythos_ssize_t)write;
 }

@@ -1,4 +1,10 @@
+# Toolchain Bythos V4
+#
+# Por defeito: estável do sistema (PC, CI, testes). O firmware ESP32 usa a
+# toolchain `esp` por substituição explícita — nunca por imposição do repo,
+# para `cargo test` funcionar em qualquer máquina sem Xtensa instalado.
+#
+# Firmware ESP32: `RUSTUP_TOOLCHAIN=esp cargo build --features esp`
 [toolchain]
-channel = "esp"
-targets = ["xtensa-esp32-none-elf", "xtensa-esp32-espidf"]
+channel = "stable"
 components = ["rustfmt", "clippy"]

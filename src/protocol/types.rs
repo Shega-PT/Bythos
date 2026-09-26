@@ -1,110 +1,188 @@
-//! # Bythos — Tipos e Definições (v3.0.0)
+//! # Bythos — Tipos e Definições (v4.0.0)
 //!
-//! Este módulo define todas as constantes, enums e structs utilizados pelo
-//! protocolo de comunicação binário Bythos v3.0.0.
+//! Este módulo é a única fonte de verdade do protocolo Bythos V4: constantes do
+//! fio, endereçamento em anel, catálogo de campos e estruturas de mensagem.
 //!
-//! O protocolo é partilhado por todos os módulos e sistemas, sendo compatível
-//! retroativamente (backward-compatible) através de regras semânticas de versão:
-//! apenas adicionar novos campos/IDs, nunca alterar os existentes.
+//! ## O que mudou da V3 para a V4 (ler antes de mexer)
 //!
-//! ## Formato da Mensagem Bythos v3.0.0
+//! 1. **Nomenclatura exclusivamente Bythos.** `CAN`, `TLV` e `DeviceX` desapareceram
+//!    da superfície pública (ver `docs/MIGRATION-GUIDE.md`). O que era `TLV`
+//!    chama-se agora campo Bythos; o que era `CanGroup` chama-se `BythosGroup`.
+//!    Os valores numéricos no fio foram preservados para não invalidar catálogos.
+//! 2. **Endereço de anel `u16` em vez de `NODE_ID u8`.** O cabeçalho V3 só cabia em
+//!    256 nós manuais; a V4 enumera sozinha até 65535 nós (`SRC` + `DST` no fio).
+//!    Por isso o cabeçalho cresceu de 7 para 11 bytes e o máximo de 1098 para 1205.
+//! 3. **Segurança real em vez de XOR.** O byte de assinatura deu lugar a `SEC_HDR`
+//!    (4 B) + `TAG` (4 B, HMAC-SHA256 truncado, calculado em elemento seguro).
+//!    Ver `crate::protocol::secure` para o porquê de cada byte.
+//!
+//! ## Formato da trama (normativo; ver `docs/BYTHOS-SPECIFICATION.md`)
 //!
 //! ```text
-//! [START_BYTE][VERSION][NODE_ID][MSG_ID][SEQ_NUM_LO][SEQ_NUM_HI]
-//! [TLV_COUNT][TLV_FIELDS...][SIGNATURE][CRC16_LO][CRC16_HI]
+//! [INÍCIO:1][VERSÃO:1][ORIGEM:2 LE][DESTINO:2 LE][MSG:1][SEQ:2 LE]
+//! [N_CAMPOS:1][SALTOS:1][CAMPOS...][SEC_HDR:4][TAG:4][CRC16:2 LE]
 //! ```
 //!
-//! ## Campo TLV — FieldID com Tipo Embutido
+//! ## Campo Bythos — identificador com tipo embutido
 //!
 //! ```text
-//! FieldID = [TYPE:3bits][ID:5bits]
+//! BythosFieldId = [TIPO:3 bits][ID:5 bits]
 //!
-//!   Bits 7-5: Tipo de dado (0-7)
-//!   Bits 4-0: ID do campo (0-31)
+//!   Bits 7-5: tipo de dado (0-7)
+//!   Bits 4-0: id lógico do campo (0-31)
 //! ```
 //!
 //! ## Endianness
 //!
-//! Todos os campos multi-byte utilizam little-endian (LE), compatível
-//! com arquiteturas embedded (ESP32/Xtensa, ARM, etc.).
+//! Todos os campos multi-byte viajam em little-endian (LE): é a ordem nativa do
+//! ESP32/ARM/RISC-V que as pontes usam, logo zero conversões no caminho quente.
 
 // ============================================================================
-// CONSTANTES GLOBAIS — Bythos v3.0.0
+// CONSTANTES GLOBAIS — Bythos v4.0.0
 // ============================================================================
 
-/// Byte de início de cada mensagem Bythos. Usado para sincronização de frame.
+/// Byte de início de cada trama. Serve de âncora de sincronização: o analisador
+/// descarta tudo até encontrar `0xAA`, o que permite ressincronizar a meio de
+/// ruído sem estado adicional.
 pub const START_BYTE: u8 = 0xAA;
 
-/// Versão atual do protocolo Bythos.
-pub const BYTHOS_VERSION: u8 = 0x03;
+/// Versão do protocolo no fio. A V4 rejeita `0x03` por defeito; a aceitação de
+/// V3 vive apenas atrás da feature `legacy-v3-compat` (migração, nunca produção).
+pub const BYTHOS_VERSION: u8 = 0x04;
 
-/// Chave de assinatura por defeito (0x00 = sem assinatura).
-pub const DEFAULT_SIGNATURE_KEY: u8 = 0x00;
+/// Versão V3, aceite somente com `legacy-v3-compat`. Existe para que uma ponte em
+/// migração consiga ler o parque instalado sem bifurcar o código de análise.
+#[cfg(feature = "legacy-v3-compat")]
+pub const BYTHOS_VERSION_V3: u8 = 0x03;
 
-/// Número máximo de bytes de dados em um campo TLV normal.
-pub const MAX_TLV_DATA: usize = 32;
+/// Nº máximo de bytes de dados num campo normal.
+///
+/// 32 B é o compromisso histórico do Bythos: cabe em 1–2 fragmentos de qualquer
+/// rádio (LoRa incluído) e mantém o tampão máximo da mensagem abaixo de ~1,2 KiB,
+/// comportável na pilha de um MCU pequeno.
+pub const MAX_FIELD_DATA: usize = 32;
 
-/// Número máximo de bytes de dados em um campo TLV de vídeo.
-pub const MAX_TLV_VIDEO_DATA: usize = 128;
+/// Nº máximo de bytes de dados no campo de carga vídeo (apenas tipo `Raw`).
+///
+/// 128 B permite transportar macroblocos úteis sem rebentar o MTU do anel; mais
+/// que isto obrigaria a janelas de remontagem grandes nas pontes. Só é aceite em
+/// campos cujo tipo é `Raw` — um `f32` de 128 B seria corrupção, não vídeo.
+pub const MAX_FIELD_VIDEO_DATA: usize = 128;
 
-/// Número máximo de campos TLV por mensagem.
-pub const MAX_TLV_FIELDS: usize = 32;
+/// Nº máximo de campos por mensagem.
+///
+/// 32 campos × 34 B cobrem a telemetria completa de um nó (GPS+IMU+energia+estado)
+/// numa só trama, sem alocar: o construtor e o analisador usam arrays fixos.
+pub const MAX_FIELDS: usize = 32;
 
-/// Tamanho do cabeçalho da mensagem Bythos (start + version + nodeId + msgId + seq(2) + tlvCount).
-pub const BYTHOS_HEADER_SIZE: usize = 7;
+/// Tamanho do cabeçalho V4: início(1) + versão(1) + origem(2) + destino(2) +
+/// msg(1) + seq(2) + n_campos(1) + saltos(1) = 11 bytes.
+///
+/// Cresceu 4 bytes face à V3 (7 B): o preço da origem/destino de 16 bits e do
+/// limite de saltos que impede tempestades de repetição em erro de cablagem.
+pub const BYTHOS_HEADER_SIZE: usize = 11;
 
-/// Tamanho do checksum CRC16 no final da mensagem.
+/// Tamanho do CRC16 no fim da trama. Mantido da V3: deteção barata de corrupção
+/// acidental antes de acordar o elemento seguro (que custa tempo e energia).
 pub const CRC16_SIZE: usize = 2;
 
-/// Tamanho do campo de assinatura.
-pub const SIGNATURE_SIZE: usize = 1;
+/// Tamanho do cabeçalho de segurança: `[KEY_ID:1][CTR:3 LE]`.
+///
+/// - `KEY_ID` escolhe a ranhura de chave no elemento seguro (`0xFF` = legado);
+/// - `CTR` é o contador monotónico de 24 bits que derrota repetição de tramas.
+pub const SEC_HDR_SIZE: usize = 4;
 
-/// Tamanho do cabeçalho de cada campo TLV (id + len).
-pub const TLV_HEADER_SIZE: usize = 2;
+/// Tamanho da etiqueta de autenticação: HMAC-SHA256 truncado a 32 bits.
+///
+/// 4 B é o ponto de equilíbrio decidido para os dois modos físicos S/L: cabe no
+/// MTU curto sem fragmentar e exige ~2³² tentativas em linha para forjar — o anel
+/// sinaliza o atacante muito antes disso (ver `docs/THREAT-MODEL.md`).
+pub const TAG_SIZE: usize = 4;
 
-/// Tamanho total de overhead da mensagem (header + signature + crc16).
-/// Calculado como: 7 (header) + 1 (signature) + 2 (crc16) = 10
-pub const BYTHOS_OVERHEAD: usize = BYTHOS_HEADER_SIZE + SIGNATURE_SIZE + CRC16_SIZE;
+/// Tamanho do cabeçalho de cada campo: `[FIELD_ID:1][LEN:1]`.
+pub const FIELD_HEADER_SIZE: usize = 2;
 
-/// Tamanho máximo de uma mensagem Bythos serializada em bytes.
-/// Calculado como: BYTHOS_HEADER_SIZE + MAX_TLV_FIELDS * (2 + MAX_TLV_DATA) + SIGNATURE_SIZE + CRC16_SIZE
-/// = 7 + 32*(2+32) + 1 + 2 = 7 + 1088 + 3 = 1098
+/// Sobrecarga total da trama: cabeçalho(11) + segurança(4) + etiqueta(4) + crc(2).
+///
+/// 21 bytes contra 10 da V3. O acréscimo compra: endereçamento ilimitado (4 B),
+/// anti-replay (3 B), autenticação real (4 B) e limite de saltos (1 B).
+pub const BYTHOS_OVERHEAD: usize = BYTHOS_HEADER_SIZE + SEC_HDR_SIZE + TAG_SIZE + CRC16_SIZE;
+
+/// Tamanho máximo de uma trama V4 serializada, em bytes.
+///
+/// Pior caso comportável: 31 campos normais cheios + 1 campo vídeo cheio.
+/// `11 + 31·(2+32) + (2+128) + 10 = 1205`. Duas cargas vídeo cheias na mesma
+/// trama são recusadas na construção — o tampão do analisador tem de caber na
+/// pilha de um MCU, e 1205 B já é o teto sensato.
 pub const MAX_MESSAGE_SIZE: usize = BYTHOS_HEADER_SIZE
-    + MAX_TLV_FIELDS * (TLV_HEADER_SIZE + MAX_TLV_DATA)
-    + SIGNATURE_SIZE
+    + (MAX_FIELDS - 1) * (FIELD_HEADER_SIZE + MAX_FIELD_DATA)
+    + (FIELD_HEADER_SIZE + MAX_FIELD_VIDEO_DATA)
+    + SEC_HDR_SIZE
+    + TAG_SIZE
     + CRC16_SIZE;
 
+/// Endereço de difusão: trama para todos os nós do anel.
+///
+/// Reservar o topo (`0xFFFF`) em vez do zero permite que `0` seja a raiz `BG-0`
+/// e que endereço "não atribuído" (`0` antes da enumeração) nunca seja difusão
+/// por acidente.
+pub const BROADCAST_ADDR: u16 = 0xFFFF;
+
+/// Endereço da raiz do anel. O único endereço configurável à mão (jumper `ROOT`
+/// na ponte); todos os outros nascem da enumeração automática, por ordem física.
+pub const ROOT_ADDR: u16 = 0;
+
+/// Limite de saltos por defeito. 32 cobre um anel de 1000 nós pelo sentido curto
+/// (500 saltos no pior caso… ver nota) — na prática o encaminhador escolhe o
+/// sentido com menos saltos, logo 32 chega com folga e trava loops de mis-wire.
+///
+/// Nota de dimensionamento: anel de 1000 nós tem diâmetro 500; se um dia o anel
+/// passar disso, subir `HOP_DEFAULT` exige apenas acordo de frota, não fio novo.
+pub const HOP_DEFAULT: u8 = 32;
+
+/// `KEY_ID` que marca modo legado V3 (XOR, sem `TAG` real).
+///
+/// Existe só para migração com `legacy-v3-compat`. Produção recusa-o: o analisador
+/// trata `0xFF` como "autenticação ausente" e o construtor nunca o emite sem a
+/// feature ligada.
+pub const KEY_ID_LEGACY: u8 = 0xFF;
+
 // ============================================================================
-// ENUMS — TIPOS DE DADO TLV (3 bits = 8 valores)
+// TIPOS DE DADO DO CAMPO (3 bits = 8 valores)
 // ============================================================================
 
-/// Tipos de dados suportados pelo Bythos.
+/// Tipos de dado que um campo Bythos pode transportar.
 ///
-/// Cada campo TLV tem um tipo embutido no FieldID (bits 7-5).
-/// O tipo determina a semântica e o tamanho dos dados.
+/// O tipo viaja embutido nos bits 7-5 do identificador (ver `BythosFieldId`), de
+/// modo que o recetor sabe o tamanho esperado sem tabela externa — essencial
+/// para validar `LEN` contra corrupção antes de copiar.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FieldType {
-    /// Dados brutos (payload binário, vídeo, etc). Tamanho variável.
+pub enum BythosFieldType {
+    /// Dados brutos (carga binária, vídeo). Tamanho variável, único tipo que
+    /// pode usar os 128 B de `MAX_FIELD_VIDEO_DATA`.
     Raw = 0,
-    /// Float de 32 bits (sensores GPS, IMU, Flight).
+    /// Vírgula flutuante de 32 bits (GPS, IMU, voo, energia).
     Float32 = 1,
-    /// Float de 16 bits (half-precision, sensores com precisão reduzida).
+    /// Vírgula flutuante de 16 bits (sensores de precisão reduzida).
     Float16 = 2,
-    /// Inteiro sinalizado de 32 bits.
+    /// Inteiro com sinal de 32 bits.
     Int32 = 3,
     /// Inteiro sem sinal de 32 bits (contadores, uptime).
     Uint32 = 4,
-    /// Inteiro sem sinal de 16 bits (frame ID, counters).
+    /// Inteiro sem sinal de 16 bits (frame id, contadores curtos).
     Uint16 = 5,
-    /// Inteiro sem sinal de 8 bits (estado, flags, enum).
+    /// Inteiro sem sinal de 8 bits (estado, modos, cargas).
     Uint8 = 6,
-    /// Booleano (0=false, 1=true).
+    /// Booleano (`0` = falso, diferente de `0` = verdadeiro).
     Bool = 7,
 }
 
-impl FieldType {
-    /// Converte um valor u8 (0-7) para FieldType.
+impl BythosFieldType {
+    /// Converte um valor de 3 bits no tipo correspondente.
+    ///
+    /// Retorna `None` para valores > 7 — o que, vindos do fio, significa
+    /// necessariamente corrupção ou dessincronização, nunca "tipo futuro".
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Raw),
@@ -119,7 +197,10 @@ impl FieldType {
         }
     }
 
-    /// Retorna o tamanho em bytes padrão para o tipo, ou 0 para Raw (variável).
+    /// Tamanho canónico do tipo em bytes; `0` para `Raw` (variável).
+    ///
+    /// O validador usa isto para apertar a malha: um campo `Float32` com
+    /// `LEN != 4` é rejeitado mesmo que caiba nos 32 B genéricos.
     pub fn default_size(&self) -> usize {
         match self {
             Self::Raw => 0,
@@ -135,46 +216,53 @@ impl FieldType {
 }
 
 // ============================================================================
-// ENUMS — IDENTIFICADORES DE MENSAGEM (MsgID)
+// IDENTIFICADORES DE MENSAGEM (BythosMsgId)
 // ============================================================================
 
-/// Identificadores de mensagem (MsgID).
+/// Tipos de mensagem do Bythos V4.
 ///
-/// Cada tipo de mensagem tem um ID único que define o seu propósito
-/// e o conjunto de campos TLV que contém.
-///
-/// Valores na faixa 0x10-0x1F para mensagens do sistema.
+/// A base `0x10–0x1B` é a V3 (valores intocados); `0x1C–0x1F` nascem com o anel:
+/// enumeração, supervisão de fecho e diagnóstico de cablagem. Nada acima de `0x1F`
+/// é válido — reserva-se espaço sem prometer semântica.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MsgId {
-    /// Heartbeat — sinal de vida do módulo, enviado periodicamente.
+pub enum BythosMsgId {
+    /// Presença periódica do nó.
     Heartbeat = 0x10,
-    /// Telemetria — dados de sensores e estado do sistema.
+    /// Dados de sensores e estado.
     Telemetry = 0x11,
-    /// Comando — instrução enviada ao módulo.
+    /// Instrução para o nó.
     Command = 0x12,
-    /// Confirmação (ACK) — confirmação de receção de mensagem.
+    /// Confirmação de receção.
     Ack = 0x13,
-    /// Failsafe — estado de segurança de emergência.
+    /// Estado de segurança de emergência.
     Failsafe = 0x14,
-    /// Debug — mensagens de depuração.
+    /// Diagnóstico.
     Debug = 0x15,
-    /// Vídeo — dados de vídeo fragmentados.
+    /// Vídeo fragmentado (ver `crate::tunnel`).
     Video = 0x16,
-    /// Shell — acesso a consola remota.
+    /// Consola remota.
     Shell = 0x17,
-    /// Dados de sensores SI (Sensor Interface).
+    /// Dados de integridade estrutural.
     SiData = 0x18,
-    /// Watchdog — keepalive de monitorização.
+    /// Vigilância (keepalive de supervisão).
     Watchdog = 0x19,
-    /// Ping — teste de conectividade.
+    /// Eco para medir latência do anel.
     Ping = 0x1A,
-    /// Clock — sincronização temporal.
+    /// Relógio + anúncio de modo físico S/L.
     Clock = 0x1B,
+    /// Enumeração: carrega a posição proposta no anel. **Novo V4.**
+    Hello = 0x1C,
+    /// Enumeração: difunde o total `N` após fecho. **Novo V4.**
+    Count = 0x1D,
+    /// Anel partido: modo linha, encaminhar pelo lado vivo. **Novo V4.**
+    RingOpen = 0x1E,
+    /// Erro de cablagem (porta cruzada, duplo ROOT…). **Novo V4.**
+    WiringFault = 0x1F,
 }
 
-impl MsgId {
-    /// Converte um valor u8 para MsgId, retornando None se inválido.
+impl BythosMsgId {
+    /// Converte um byte no tipo correspondente; `None` = reservado/inválido.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0x10 => Some(Self::Heartbeat),
@@ -189,41 +277,47 @@ impl MsgId {
             0x19 => Some(Self::Watchdog),
             0x1A => Some(Self::Ping),
             0x1B => Some(Self::Clock),
+            0x1C => Some(Self::Hello),
+            0x1D => Some(Self::Count),
+            0x1E => Some(Self::RingOpen),
+            0x1F => Some(Self::WiringFault),
             _ => None,
         }
     }
 
-    /// Retorna true se o ID da mensagem é válido.
+    /// Atalho de validação para o caminho quente do analisador.
     pub fn is_valid(id: u8) -> bool {
         Self::from_u8(id).is_some()
     }
 }
 
 // ============================================================================
-// ENUMS — NÍVEIS DE PRIORIDADE
+// PRIORIDADE BYTHOS
 // ============================================================================
 
-/// Níveis de prioridade para ordenação de mensagens.
+/// Níveis de prioridade para ordenação e backoff no anel.
 ///
-/// Valores menores indicam prioridade mais alta.
-/// Mapeia diretamente para os 3 bits de prioridade no CAN ID.
+/// Valor menor = mais urgente. Herdam a semântica V3 (que os mapeava nos 3 bits
+/// do antigo CAN ID); na V4 viajam implicitamente no tipo de mensagem e decidem
+/// quem recua primeiro em contenção no par de dados.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PriorityLevel {
-    /// Crítico — processamento imediato, não pode ser adiado.
+pub enum BythosPriority {
+    /// Emergência: processa já, não adia.
     SuperCritical = 0,
-    /// Crítico — processamento urgente, precede todas as tarefas normais.
+    /// Urgente: precede todo o tráfego normal.
     Critical = 1,
-    /// Alta — processamento urgente, precede tarefas normais.
+    /// Alta: precede tarefas normais (comandos, relógio).
     High = 2,
-    /// Normal — processamento padrão.
+    /// Normal: telemetria rotineira.
     Medium = 3,
-    /// Baixa — processamento quando disponível.
+    /// Fundo: diagnóstico e vídeo preenchem o que sobra.
     Low = 4,
 }
 
-impl PriorityLevel {
-    /// Converte um valor u8 para PriorityLevel.
+impl BythosPriority {
+    /// Conversão saturante: valores desconhecidos caem para `Low` em vez de
+    /// falharem — prioridade é dica de escalonamento, nunca gate de segurança.
     pub fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::SuperCritical,
@@ -236,24 +330,33 @@ impl PriorityLevel {
 }
 
 // ============================================================================
-// ENUMS — ESTADO DO SISTEMA
+// ESTADO DO SISTEMA, MODO DE VOO, FAILSAFE (inalterados da V3 — só vivem aqui)
 // ============================================================================
 
-/// Estados possíveis do sistema.
+/// Estados possíveis do sistema anfitrião (cargas úteis continuam a usá-los).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemState {
+    /// Arranque a frio, periféricos ainda a inicializar.
     Booting = 0,
+    /// A configurar, ainda sem operar.
     Initializing = 1,
+    /// Pronto para operar.
     Ready = 2,
+    /// Armado (atuadores energizados).
     Armed = 3,
+    /// Em missão.
     InFlight = 4,
+    /// A aterrar/recolher.
     Landing = 5,
+    /// Erro que exige atenção.
     Error = 6,
+    /// A desligar de forma ordeira.
     Shutdown = 7,
 }
 
 impl SystemState {
+    /// Conversão estrita: fora de `0–7` é corrupção, não estado futuro.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Booting),
@@ -269,27 +372,29 @@ impl SystemState {
     }
 }
 
-// ============================================================================
-// ENUMS — MODO DE VOO (UAV/UAS)
-// ============================================================================
-
-/// Modos de voo disponíveis.
+/// Modos de voo para cargas UAV/UAS.
 ///
-/// **UAV/UAS específico** — Este enum é preservado no core do Bythos
-/// para compatibilidade com sistemas de voo não tripulado (UAV/UAS).
-/// Aplicações que não sejam UAV/UAS podem ignorar este enum.
+/// Mantido no núcleo por compatibilidade com o parque V3; frotas não-UAV
+/// ignoram-no sem custo (é só um byte num campo `Uint8`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlightMode {
+    /// Controlo manual total.
     Manual = 0,
+    /// Atitude estabilizada.
     Stabilize = 1,
+    /// Altitude mantida.
     AltHold = 2,
+    /// Missão automática.
     Auto = 3,
+    /// Guiado por estação.
     Guided = 4,
+    /// Regresso ao ponto de partida.
     Rtl = 5,
 }
 
 impl FlightMode {
+    /// Conversão estrita (`None` fora de `0–5`).
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Manual),
@@ -303,23 +408,26 @@ impl FlightMode {
     }
 }
 
-// ============================================================================
-// ENUMS — MOTIVO E AÇÃO DE FAILSAFE
-// ============================================================================
-
-/// Motivos para ativação do failsafe.
+/// Motivos de ativação do failsafe.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FailsafeReason {
+    /// Sem failsafe.
     None = 0,
+    /// Perda de ligação com a estação/anel.
     SignalLost = 1,
+    /// Bateria abaixo do limiar.
     LowBattery = 2,
+    /// Perda de GPS.
     GpsLost = 3,
+    /// Sensor crítico em falha.
     SensorFailure = 4,
+    /// Acionamento manual.
     ManualTrigger = 5,
 }
 
 impl FailsafeReason {
+    /// Conversão estrita (`None` fora de `0–5`).
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::None),
@@ -333,19 +441,26 @@ impl FailsafeReason {
     }
 }
 
-/// Ações a tomar quando o failsafe é ativado.
+/// Ações executadas quando o failsafe dispara.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FailsafeAction {
+    /// Nada a fazer.
     None = 0,
+    /// Pairar no ponto.
     Hover = 1,
+    /// Aterrar onde está.
     Land = 2,
+    /// Regressar ao ponto de partida.
     Rtl = 3,
+    /// Prosseguir a missão.
     Continue = 4,
+    /// Desarmar atuadores.
     Disarm = 5,
 }
 
 impl FailsafeAction {
+    /// Conversão estrita (`None` fora de `0–5`).
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::None),
@@ -360,105 +475,111 @@ impl FailsafeAction {
 }
 
 // ============================================================================
-// ENUMS — GRUPOS COMPUTACIONAIS (CAN)
+// GRUPOS BYTHOS (papel funcional do nó — ex-CanGroup, renomeado e funcional)
 // ============================================================================
 
-/// Identificadores de grupo no bus CAN.
+/// Papel funcional de um nó no sistema.
 ///
-/// Cada módulo/hardware do sistema pertence a um grupo computacional.
-/// O grupo é utilizado no CAN ID extended (29-bit) para roteamento.
-///
-/// Nomes genéricos (Device0..Device14) para uso em qualquer sistema.
+/// A V3 chamava a isto `CanGroup` com nomes `Device0…Device14` — opacos e presos
+/// ao barramento antigo. A V4 dá nomes de **função** (o fio só transporta os 4
+/// bits; o nome é para humanos e para o backoff de contenção). Os valores são os
+/// mesmos da V3 para não quebrar tabelas de comissionamento.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CanGroup {
-    /// Nenhum grupo / broadcast.
+pub enum BythosGroup {
+    /// Sem grupo / difusão funcional.
     None = 0x0,
-    /// Grupo de dispositivo genérico 0.
-    Device0 = 0x1,
-    /// Grupo de dispositivo genérico 1.
-    Device1 = 0x2,
-    /// Grupo de dispositivo genérico 2.
-    Device2 = 0x3,
-    /// Grupo de dispositivo genérico 3.
-    Device3 = 0x4,
-    /// Grupo de dispositivo genérico 4.
-    Device4 = 0x5,
-    /// Grupo de dispositivo genérico 5.
-    Device5 = 0x6,
-    /// Grupo de dispositivo genérico 6.
-    Device6 = 0x7,
-    /// Grupo de dispositivo genérico 7.
-    Device7 = 0x8,
-    /// Grupo de dispositivo genérico 8.
-    Device8 = 0x9,
-    /// Grupo de dispositivo genérico 9.
-    Device9 = 0xA,
-    /// Grupo de dispositivo genérico 10.
-    Device10 = 0xB,
-    /// Grupo de dispositivo genérico 11.
-    Device11 = 0xC,
-    /// Grupo de dispositivo genérico 12.
-    Device12 = 0xD,
-    /// Grupo de dispositivo genérico 13.
-    Device13 = 0xE,
-    /// Grupo de dispositivo genérico 14.
-    Device14 = 0xF,
+    /// Orquestração central (tipicamente o BG-0 físico, mas papel ≠ endereço).
+    Control = 0x1,
+    /// Aquisição de sensores.
+    Sensors = 0x2,
+    /// Controlo de atuadores.
+    Actuators = 0x3,
+    /// Supervisão de segurança.
+    Safety = 0x4,
+    /// Resposta a emergência.
+    Emergency = 0x5,
+    /// Visão por computador.
+    Vision = 0x6,
+    /// Reserva funcional 7.
+    Aux7 = 0x7,
+    /// Reserva funcional 8.
+    Aux8 = 0x8,
+    /// Reserva funcional 9.
+    Aux9 = 0x9,
+    /// Reserva funcional 10.
+    Aux10 = 0xA,
+    /// Reserva funcional 11.
+    Aux11 = 0xB,
+    /// Reserva funcional 12.
+    Aux12 = 0xC,
+    /// Reserva funcional 13.
+    Aux13 = 0xD,
+    /// Reserva funcional 14.
+    Aux14 = 0xE,
+    /// Reserva funcional 15.
+    Aux15 = 0xF,
 }
 
-impl CanGroup {
+impl BythosGroup {
+    /// Conversão estrita de 4 bits; `None` fora de `0x0–0xF`.
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0x0 => Some(Self::None),
-            0x1 => Some(Self::Device0),
-            0x2 => Some(Self::Device1),
-            0x3 => Some(Self::Device2),
-            0x4 => Some(Self::Device3),
-            0x5 => Some(Self::Device4),
-            0x6 => Some(Self::Device5),
-            0x7 => Some(Self::Device6),
-            0x8 => Some(Self::Device7),
-            0x9 => Some(Self::Device8),
-            0xA => Some(Self::Device9),
-            0xB => Some(Self::Device10),
-            0xC => Some(Self::Device11),
-            0xD => Some(Self::Device12),
-            0xE => Some(Self::Device13),
-            0xF => Some(Self::Device14),
+            0x1 => Some(Self::Control),
+            0x2 => Some(Self::Sensors),
+            0x3 => Some(Self::Actuators),
+            0x4 => Some(Self::Safety),
+            0x5 => Some(Self::Emergency),
+            0x6 => Some(Self::Vision),
+            0x7 => Some(Self::Aux7),
+            0x8 => Some(Self::Aux8),
+            0x9 => Some(Self::Aux9),
+            0xA => Some(Self::Aux10),
+            0xB => Some(Self::Aux11),
+            0xC => Some(Self::Aux12),
+            0xD => Some(Self::Aux13),
+            0xE => Some(Self::Aux14),
+            0xF => Some(Self::Aux15),
             _ => None,
         }
     }
 }
 
 // ============================================================================
-// ENUMS — TIPOS DE MENSAGEM CAN
+// ESPÉCIE BYTHOS (natureza do tráfego — ex-CanMsgType, renomeado)
 // ============================================================================
 
-/// Tipos de mensagem no CAN ID extended (4 bits).
+/// Natureza do tráfego, usada no escalonamento e no diagnóstico do anel.
 ///
-/// Utilizados no campo TIPO_MSG do CAN ID (bits 17-14).
+/// Na V3 estes 4 bits viajavam no CAN ID de 29 bits; na V4 o fio do anel não tem
+/// CAN ID — a espécie deriva-se do `MSG` (ver `kind_of`) e serve o firmware da
+/// ponte (filas, contadores, deteção do barramento de segurança).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CanMsgType {
-    /// Dados de telemetria / sensores.
+pub enum BythosKind {
+    /// Telemetria / dados de sensores.
     Data = 0x0,
     /// Comandos.
     Cmd = 0x1,
-    /// Confirmação de receção (ACK).
+    /// Confirmação de receção.
     Ack = 0x2,
     /// Eventos / failsafe.
     Event = 0x3,
     /// Sincronização temporal.
     Sync = 0x4,
-    /// Broadcast de estado.
+    /// Difusão de estado.
     State = 0x5,
-    /// Heartbeat.
+    /// Presença.
     Heart = 0x6,
-    /// Dados de segurança.
+    /// Tráfego de segurança (prioridade máxima efetiva).
     Safety = 0x7,
+    /// Gestão do anel (Hello/Count/RingOpen/WiringFault). **Novo V4.**
+    Ring = 0x8,
 }
 
-impl CanMsgType {
+impl BythosKind {
+    /// Conversão estrita (`None` fora de `0x0–0x8`).
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0x0 => Some(Self::Data),
@@ -469,684 +590,1083 @@ impl CanMsgType {
             0x5 => Some(Self::State),
             0x6 => Some(Self::Heart),
             0x7 => Some(Self::Safety),
+            0x8 => Some(Self::Ring),
+            _ => None,
+        }
+    }
+
+    /// Deriva a espécie a partir do tipo de mensagem do fio.
+    ///
+    /// É o ponto único de verdade para classificar tráfego sem CAN ID: qualquer
+    /// fila de prioridade da ponte deve chamar aqui, nunca adivinhar por `MSG`.
+    pub fn kind_of(msg_id: u8) -> Option<Self> {
+        match msg_id {
+            0x10 => Some(Self::Heart),
+            0x11 => Some(Self::Data),
+            0x12 => Some(Self::Cmd),
+            0x13 => Some(Self::Ack),
+            0x14 => Some(Self::Safety),
+            0x15 => Some(Self::Data),
+            0x16 => Some(Self::Data),
+            0x17 => Some(Self::Cmd),
+            0x18 => Some(Self::Data),
+            0x19 => Some(Self::Heart),
+            0x1A => Some(Self::Sync),
+            0x1B => Some(Self::Sync),
+            0x1C..=0x1F => Some(Self::Ring),
             _ => None,
         }
     }
 }
 
 // ============================================================================
-// FUNÇÕES — CAN ID
+// ENDEREÇO BYTHOS (ordem no anel — substitui o CAN ID de 29 bits)
 // ============================================================================
 
-/// Constrói um CAN ID extended (29-bit) a partir dos seus componentes.
+/// Endereço de um nó no anel: posição física após enumeração (`0–65535`).
 ///
-/// Formato:
-/// ```text
-/// [PRIORIDADE:3][GRUPO_ORIGEM:4][GRUPO_DESTINO:4][TIPO_MSG:4][RESERVADO:14]
-/// ```
+/// Substitui o CAN ID extended da V3. Onde a V3 empacotava prioridade+grupos+tipo
+/// em 29 bits de arbitragem, a V4 endereça por posição e arbitra por
+/// prioridade+grupo no firmware da ponte — separação limpa entre "para onde vai"
+/// (este endereço) e "com que urgência" (`BythosPriority` + `BythosGroup`).
 ///
-/// # Arguments
-/// * `priority` — Nível de prioridade (0-4).
-/// * `src_group` — Grupo de origem (0x0-0xF).
-/// * `dst_group` — Grupo de destino (0x0= broadcast).
-/// * `msg_type` — Tipo de mensagem (0x0-0x7).
+/// Representação compacta no fio: apenas o `u16` de posição. Os metadados de
+/// escalonamento viajam fora do fio quente ou derivam-se do `MSG`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BythosAddress {
+    /// Posição no anel (`0` = raiz, `0xFFFF` = difusão).
+    pub pos: u16,
+    /// Papel funcional do nó (dica de escalonamento, não encaminhamento).
+    pub group: BythosGroup,
+    /// Natureza do tráfego (dica de escalonamento, não encaminhamento).
+    pub kind: BythosKind,
+    /// Prioridade efetiva (decide backoff em contenção).
+    pub priority: BythosPriority,
+}
+
+impl BythosAddress {
+    /// Constrói um endereço com validação de gamas.
+    ///
+    /// `None` se o grupo ou a espécie forem desconhecidos — programar um nó com
+    /// papel inválido deve falhar no comissionamento, nunca a meio do voo.
+    pub fn new(pos: u16, group: u8, kind: u8, priority: u8) -> Option<Self> {
+        Some(Self {
+            pos,
+            group: BythosGroup::from_u8(group)?,
+            kind: BythosKind::from_u8(kind)?,
+            priority: BythosPriority::from_u8(priority),
+        })
+    }
+
+    /// Atalho para difusão com espécie e prioridade dadas.
+    pub fn broadcast(kind: BythosKind, priority: BythosPriority) -> Self {
+        Self {
+            pos: BROADCAST_ADDR,
+            group: BythosGroup::None,
+            kind,
+            priority,
+        }
+    }
+
+    /// `true` se for o barramento de segurança (espécie `Safety`).
+    ///
+    /// Substitui `is_safety_bus_id` da V3: mesma semântica, nome Bythos.
+    pub fn is_safety(&self) -> bool {
+        self.kind == BythosKind::Safety
+    }
+}
+
+/// Constrói o par de encaminhamento `(origem, destino)` validado.
 ///
-/// # Returns
-/// CAN ID de 29 bits.
-pub fn make_can_id(priority: u8, src_group: u8, dst_group: u8, msg_type: u8) -> u32 {
-    let mut can_id: u32 = 0;
-    can_id |= ((priority as u32) & 0x07) << 26;
-    can_id |= ((src_group as u32) & 0x0F) << 22;
-    can_id |= ((dst_group as u32) & 0x0F) << 18;
-    can_id |= ((msg_type as u32) & 0x0F) << 14;
-    can_id
-}
-
-/// Extrai a prioridade de um CAN ID extended.
-pub fn can_id_priority(can_id: u32) -> u8 {
-    ((can_id >> 26) & 0x07) as u8
-}
-
-/// Extrai o grupo de origem de um CAN ID extended.
-pub fn can_id_src_group(can_id: u32) -> u8 {
-    ((can_id >> 22) & 0x0F) as u8
-}
-
-/// Extrai o grupo de destino de um CAN ID extended.
-pub fn can_id_dst_group(can_id: u32) -> u8 {
-    ((can_id >> 18) & 0x0F) as u8
-}
-
-/// Extrai o tipo de mensagem de um CAN ID extended.
-pub fn can_id_msg_type(can_id: u32) -> u8 {
-    ((can_id >> 14) & 0x0F) as u8
-}
-
-/// Verifica se o CAN ID é do bus de segurança (msg_type == Safety).
-pub fn is_safety_bus_id(can_id: u32) -> bool {
-    can_id_msg_type(can_id) == CanMsgType::Safety as u8
+/// Substitui `make_can_id` da V3. Não há 29 bits nem máscaras: o anel encaminha
+/// por comparação de posições (ver `crate::ring`), por isso só se valida que os
+/// metadados são conhecidos.
+pub fn make_bythos_route(
+    src_pos: u16,
+    dst_pos: u16,
+    group: u8,
+    kind: u8,
+    priority: u8,
+) -> Option<(BythosAddress, BythosAddress)> {
+    let group_v = BythosGroup::from_u8(group)?;
+    let kind_v = BythosKind::from_u8(kind)?;
+    let prio_v = BythosPriority::from_u8(priority);
+    Some((
+        BythosAddress {
+            pos: src_pos,
+            group: group_v,
+            kind: kind_v,
+            priority: prio_v,
+        },
+        BythosAddress {
+            pos: dst_pos,
+            group: group_v,
+            kind: kind_v,
+            priority: prio_v,
+        },
+    ))
 }
 
 // ============================================================================
-// FUNÇÕES — FIELDID COM TIPO EMBUTIDO
+// IDENTIFICADOR DE CAMPO COM TIPO EMBUTIDO
 // ============================================================================
 
-/// Codifica um FieldID com tipo embutido (3 bits tipo + 5 bits id).
+/// Codifica um identificador de campo: `[TIPO:3][ID:5]`.
 ///
-/// # Arguments
-/// * `field_type` — Tipo de dado (0-7).
-/// * `field_id` — Identificador do campo dentro do tipo (0-31).
-///
-/// # Returns
-/// FieldID codificado: `[TYPE:3][ID:5]`
-pub fn field_id_encode(field_type: u8, field_id: u8) -> u8 {
+/// O mascaramento (`& 0x07`, `& 0x1F`) é intencional: IDs lógicos acima de 31
+/// dobram em vez de rebentar o byte — o catálogo (`BythosFieldId`) só usa IDs
+/// válidos, e o validador aperta `LEN` por tipo a seguir.
+pub fn bythos_field_id_encode(field_type: u8, field_id: u8) -> u8 {
     ((field_type & 0x07) << 5) | (field_id & 0x1F)
 }
 
-/// Decodifica um FieldID nos seus componentes (tipo e id).
-///
-/// # Arguments
-/// * `field_id` — FieldID codificado.
-///
-/// # Returns
-/// Tuplo (tipo, id) onde tipo ∈ [0,7] e id ∈ [0,31].
-pub fn field_id_decode(field_id: u8) -> (u8, u8) {
-    let field_type = (field_id >> 5) & 0x07;
-    let id = field_id & 0x1F;
-    (field_type, id)
+/// Decodifica um identificador nos seus componentes `(tipo, id)`.
+pub fn bythos_field_id_decode(field_id: u8) -> (u8, u8) {
+    ((field_id >> 5) & 0x07, field_id & 0x1F)
 }
 
-/// Valida se um FieldID codificado tem um tipo válido.
-pub fn is_valid_field_id(field_id: u8) -> bool {
-    let (field_type, _) = field_id_decode(field_id);
-    FieldType::from_u8(field_type).is_some()
+/// Valida o tipo embutido (bits 7-5).
+///
+/// Nota honesta: qualquer byte tem tipo `0–7`, logo isto é sempre verdade — o
+/// valor real está em `BythosFieldType::from_u8` + verificação de `LEN` por tipo
+/// no validador. Mantém-se como barreira de leitura, não como prova.
+pub fn is_valid_bythos_field_id(field_id: u8) -> bool {
+    let (field_type, _) = bythos_field_id_decode(field_id);
+    BythosFieldType::from_u8(field_type).is_some()
 }
 
 // ============================================================================
-// FUNÇÕES — ASSINATURA (XOR Key)
+// ETIQUETA LEGADA (XOR — migração apenas, nunca produção)
 // ============================================================================
 
-/// Calcula a assinatura de uma mensagem Bythos.
+/// Calcula a etiqueta XOR legada V3 (`chave ^ msg ^ seq_lo ^ seq_hi`).
 ///
-/// A assinatura é calculada como XOR de:
-/// - `key` — Chave partilhada do nó transmissor
-/// - `msg_id` — ID da mensagem
-/// - `seq_lo` — Byte baixo do número de sequência
-/// - `seq_hi` — Byte alto do número de sequência
-///
-/// # Arguments
-/// * `key` — Chave partilhada (1 byte).
-/// * `msg_id` — ID da mensagem.
-/// * `seq_lo` — Byte baixo do SEQ_NUM.
-/// * `seq_hi` — Byte alto do SEQ_NUM.
-///
-/// # Returns
-/// Byte de assinatura (0x00-0xFF).
-pub fn compute_signature(key: u8, msg_id: u8, seq_lo: u8, seq_hi: u8) -> u8 {
+/// Existe para que pontes em migração (`legacy-v3-compat`) consigam **ler** o
+/// parque V3. Escrever V3 é desencorajado e exige a feature; produção usa `TAG`.
+pub fn compute_legacy_tag(key: u8, msg_id: u8, seq_lo: u8, seq_hi: u8) -> u8 {
     key ^ msg_id ^ seq_lo ^ seq_hi
 }
 
-/// Valida a assinatura de uma mensagem Bythos.
+/// Verifica a etiqueta XOR legada em tempo constante ingénuo.
 ///
-/// # Arguments
-/// * `signature` — Assinatura recebida.
-/// * `key` — Chave partilhada esperada.
-/// * `msg_id` — ID da mensagem.
-/// * `seq_lo` — Byte baixo do SEQ_NUM.
-/// * `seq_hi` — Byte alto do SEQ_NUM.
-///
-/// # Returns
-/// `true` se a assinatura é válida, `false` caso contrário.
-pub fn validate_signature(signature: u8, key: u8, msg_id: u8, seq_lo: u8, seq_hi: u8) -> bool {
-    signature == compute_signature(key, msg_id, seq_lo, seq_hi)
+/// Comparação direta de 1 byte; sem early-exit observável relevante a este
+/// tamanho — e tratando-se de compatibilidade, não de segurança.
+pub fn validate_legacy_tag(tag: u8, key: u8, msg_id: u8, seq_lo: u8, seq_hi: u8) -> bool {
+    tag == compute_legacy_tag(key, msg_id, seq_lo, seq_hi)
 }
 
 // ============================================================================
-// ENUMS — CAMPOS TLV (GPS, IMU, Voo, Energia, Temperatura, Sistema, etc.)
+// CATÁLOGO DE CAMPOS — IDENTIFICADORES LÓGICOS POR DOMÍNIO
 // ============================================================================
+//
+// Os enums abaixo usam IDs lógicos de domínio (podem exceder 31: são chaves de
+// catálogo, não o byte do fio). O byte do fio vive em `BythosFieldId`.
+// Mantêm-se para compatibilidade de código aplicacional V3.
 
-/// Identificadores de campos TLV para dados GPS.
-///
-/// Cada campo tem um tipo associado (f32 para a maioria).
-/// Faixa de IDs: 0x20-0x2F (tipo=1=f32, id=0x00-0x0F).
+/// Campos GPS (IDs lógicos de catálogo).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldGps {
+    /// Latitude em graus decimais (`f32`).
     Latitude = 0x20,
+    /// Longitude em graus decimais (`f32`).
     Longitude = 0x21,
+    /// Altitude em metros (`f32`).
     Altitude = 0x22,
+    /// Velocidade sobre o solo em m/s (`f32`).
     Speed = 0x23,
+    /// Rumo em graus (`f32`).
     Course = 0x24,
+    /// Satélites em vista (`u8`).
     Satellites = 0x25,
+    /// Diluição horizontal de precisão (`f32`).
     Hdop = 0x26,
 }
 
-/// Identificadores de campos TLV para dados IMU (Unidade de Medição Inercial).
-///
-/// Faixa de IDs: 0x30-0x3F (tipo=1=f32, id=0x10-0x1F).
+/// Campos da unidade inercial.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldImu {
+    /// Rolamento em graus (`f32`).
     Roll = 0x30,
+    /// Arfagem em graus (`f32`).
     Pitch = 0x31,
+    /// Guinada em graus (`f32`).
     Yaw = 0x32,
+    /// Aceleração X em m/s² (`f32`).
     AccelX = 0x33,
+    /// Aceleração Y em m/s² (`f32`).
     AccelY = 0x34,
+    /// Aceleração Z em m/s² (`f32`).
     AccelZ = 0x35,
+    /// Girómetro X em °/s (`f32`).
     GyroX = 0x36,
+    /// Girómetro Y em °/s (`f32`).
     GyroY = 0x37,
+    /// Girómetro Z em °/s (`f32`).
     GyroZ = 0x38,
+    /// Taxa de guinada em °/s (`f32`).
     YawRate = 0x39,
 }
 
-/// Identificadores de campos TLV para dados de voo.
-///
-/// Faixa de IDs: 0x40-0x4F (tipo=1=f32, id=0x20-0x2F).
+/// Campos de voo.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFlight {
+    /// Altitude GPS em metros (`f32`).
     AltGps = 0x40,
+    /// Altitude barométrica em metros (`f32`).
     AltBaro = 0x41,
+    /// Velocidade vertical em m/s (`f32`).
     VSpeed = 0x42,
+    /// Velocidade aerodinâmica em m/s (`f32`).
     Airspeed = 0x43,
+    /// Duração do ciclo de controlo em µs (`u16`).
     LoopTime = 0x44,
 }
 
-/// Identificadores de campos TLV para dados de energia.
-///
-/// Faixa de IDs: 0x50-0x5F (tipo=1=f32, id=0x30-0x3F).
+/// Campos de energia.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldPower {
+    /// Tensão da bateria em V (`f32`).
     BattVoltage = 0x50,
+    /// Corrente em A (`f32`).
     BattCurrent = 0x51,
+    /// Carga consumida em mAh (`f32`).
     BattConsumed = 0x52,
+    /// Temperatura da bateria em °C (`f32`).
     BattTemp = 0x53,
+    /// Estado de carga 0.0–1.0 (`f32`).
     BattSoc = 0x54,
 }
 
-/// Identificadores de campos TLV para dados de temperatura.
-///
-/// Faixa de IDs: 0x60-0x6F (tipo=1=f32, id=0x40-0x4F).
+/// Campos de temperatura.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldTemp {
+    /// Sensor 1 em °C (`f32`).
     Temp1 = 0x60,
+    /// Sensor 2 em °C (`f32`).
     Temp2 = 0x61,
+    /// Sensor 3 em °C (`f32`).
     Temp3 = 0x62,
+    /// Sensor 4 em °C (`f32`).
     Temp4 = 0x63,
-    Esp1Temp = 0x64,
-    Esp2Temp = 0x65,
+    /// Temperatura da ponte 1 (`f32`).
+    Bridge1Temp = 0x64,
+    /// Temperatura da ponte 2 (`f32`).
+    Bridge2Temp = 0x65,
 }
 
-/// Identificadores de campos TLV para dados de sistema.
-///
-/// Faixa de IDs: 0x70-0x7F (mistura de tipos: u8, u32).
+/// Campos de sistema.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldSystem {
+    /// Estado (`SystemState`, `u8`).
     State = 0x70,
+    /// Modo (`u8`).
     Mode = 0x71,
+    /// Tempo ligado em s (`u32`).
     Uptime = 0x72,
+    /// RAM livre em B (`u32`).
     FreeHeap = 0x73,
+    /// Carga CPU em % (`u8`).
     CpuLoad = 0x74,
-    Esp1Load = 0x75,
-    Esp2Load = 0x76,
+    /// Carga da ponte 1 em % (`u8`).
+    Bridge1Load = 0x75,
+    /// Carga da ponte 2 em % (`u8`).
+    Bridge2Load = 0x76,
 }
 
-/// Identificadores de campos TLV para dados de failsafe.
-///
-/// Faixa de IDs: 0xA1-0xAF.
+/// Campos de failsafe.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldFailsafe {
+    /// Motivo (`FailsafeReason`, `u8`).
     Reason = 0xA1,
+    /// Ação (`FailsafeAction`, `u8`).
     Action = 0xA2,
+    /// Estado do autómato de failsafe (`u8`).
     State = 0xA3,
 }
 
-/// Identificadores de campos TLV para dados de vídeo.
-///
-/// Faixa de IDs: 0xB0-0xBF.
+/// Campos de vídeo.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldVideo {
+    /// Identificador da trama (`u16`).
     FrameId = 0xB0,
+    /// Índice do fragmento (`u8`).
     ChunkId = 0xB1,
+    /// Total de fragmentos (`u8`).
     TotalChunks = 0xB2,
+    /// Carga do fragmento (`raw`, até 128 B).
     Payload = 0xB3,
 }
 
 // ============================================================================
-// ENUMS — FIELDID UNIFICADO (com tipo embutido)
+// CATÁLOGO UNIFICADO — IDENTIFICADORES JÁ CODIFICADOS PARA O FIO
 // ============================================================================
 
-/// Unificação de todos os identificadores de campos TLV.
+/// Todos os campos com o byte exato do fio (`[TIPO:3][ID:5]`).
 ///
-/// O FieldID codificado inclui o tipo de dado (3 bits) e o ID (5 bits).
-/// Este enum fornece constantes pré-codificadas para uso direto.
-///
-/// Formato: `[TYPE:3][ID:5]`
-/// - Tipo 0 (Raw): IDs 0x00-0x1F → FieldIDs 0x00-0x1F
-/// - Tipo 1 (f32): IDs 0x00-0x1F → FieldIDs 0x20-0x3F
-/// - Tipo 2 (f16): IDs 0x00-0x1F → FieldIDs 0x40-0x5F
-/// - Tipo 3 (i32): IDs 0x00-0x1F → FieldIDs 0x60-0x7F
-/// - Tipo 4 (u32): IDs 0x00-0x1F → FieldIDs 0x80-0x9F
-/// - Tipo 5 (u16): IDs 0x00-0x1F → FieldIDs 0xA0-0xBF
-/// - Tipo 6 (u8):  IDs 0x00-0x1F → FieldIDs 0xC0-0xDF
-/// - Tipo 7 (bool):IDs 0x00-0x1F → FieldIDs 0xE0-0xFF
+/// Usar estas constantes em vez de codificar à mão elimina a classe de bugs
+/// "tipo certo, id errado" — o compilador carrega o catálogo, o programador
+/// escolhe o nome. Valores herdados da V3, intocados.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FieldId {
-    // GPS — Tipo 1 (f32), IDs 0x06-0x0C
-    GpsLatitude = 0x26,   // TYPE=1(f32) + ID=6
-    GpsLongitude = 0x27,  // TYPE=1(f32) + ID=7
-    GpsAltitude = 0x28,   // TYPE=1(f32) + ID=8
-    GpsSpeed = 0x29,      // TYPE=1(f32) + ID=9
-    GpsCourse = 0x2A,     // TYPE=1(f32) + ID=10
-    GpsSatellites = 0xC7, // TYPE=6(u8)  + ID=7
-    GpsHdop = 0x2B,       // TYPE=1(f32) + ID=11
+pub enum BythosFieldId {
+    // --- GPS: f32 nos angulares/velocidades, u8 nos satélites ---
+    /// Latitude em graus (`f32`).
+    GpsLatitude = 0x26,
+    /// Longitude em graus (`f32`).
+    GpsLongitude = 0x27,
+    /// Altitude em metros (`f32`).
+    GpsAltitude = 0x28,
+    /// Velocidade em m/s (`f32`).
+    GpsSpeed = 0x29,
+    /// Rumo em graus (`f32`).
+    GpsCourse = 0x2A,
+    /// Satélites em vista (`u8`).
+    GpsSatellites = 0xC7,
+    /// HDOP (`f32`).
+    GpsHdop = 0x2B,
 
-    // IMU — Tipo 1 (f32), IDs 0x10-0x19
-    ImuRoll = 0x30,       // TYPE=1(f32) + ID=0x10
-    ImuPitch = 0x31,      // TYPE=1(f32) + ID=0x11
-    ImuYaw = 0x32,        // TYPE=1(f32) + ID=0x12
-    ImuAccelX = 0x33,     // TYPE=1(f32) + ID=0x13
-    ImuAccelY = 0x34,     // TYPE=1(f32) + ID=0x14
-    ImuAccelZ = 0x35,     // TYPE=1(f32) + ID=0x15
-    ImuGyroX = 0x36,      // TYPE=1(f32) + ID=0x16
-    ImuGyroY = 0x37,      // TYPE=1(f32) + ID=0x17
-    ImuGyroZ = 0x38,      // TYPE=1(f32) + ID=0x18
-    ImuYawRate = 0x39,    // TYPE=1(f32) + ID=0x19
+    // --- IMU: tudo f32 ---
+    /// Rolamento (`f32`).
+    ImuRoll = 0x30,
+    /// Arfagem (`f32`).
+    ImuPitch = 0x31,
+    /// Guinada (`f32`).
+    ImuYaw = 0x32,
+    /// Aceleração X (`f32`).
+    ImuAccelX = 0x33,
+    /// Aceleração Y (`f32`).
+    ImuAccelY = 0x34,
+    /// Aceleração Z (`f32`).
+    ImuAccelZ = 0x35,
+    /// Girómetro X (`f32`).
+    ImuGyroX = 0x36,
+    /// Girómetro Y (`f32`).
+    ImuGyroY = 0x37,
+    /// Girómetro Z (`f32`).
+    ImuGyroZ = 0x38,
+    /// Taxa de guinada (`f32`).
+    ImuYawRate = 0x39,
 
-    // Voo — Tipo 1 (f32), IDs 0x20-0x24
-    FlightAltGps = 0x40,  // TYPE=1(f32) + ID=0x20
-    FlightAltBaro = 0x41, // TYPE=1(f32) + ID=0x21
-    FlightVSpeed = 0x42,  // TYPE=1(f32) + ID=0x22
-    FlightAirspeed = 0x43, // TYPE=1(f32) + ID=0x23
-    FlightLoopTime = 0xA2, // TYPE=5(u16) + ID=2
+    // --- Voo ---
+    /// Altitude GPS (`f32`, id histórico fora de faixa — preservado).
+    FlightAltGps = 0x40,
+    /// Altitude barométrica (`f32`, id histórico — preservado).
+    FlightAltBaro = 0x41,
+    /// Velocidade vertical (`f32`, id histórico — preservado).
+    FlightVSpeed = 0x42,
+    /// Velocidade aerodinâmica (`f32`, id histórico — preservado).
+    FlightAirspeed = 0x43,
+    /// Duração do ciclo em µs (`u16`).
+    FlightLoopTime = 0xA2,
 
-    // Energia — Tipo 1 (f32), IDs 0x30-0x34
-    PowerBattV = 0x50,    // TYPE=1(f32) + ID=0x30
-    PowerBattI = 0x51,    // TYPE=1(f32) + ID=0x31
-    PowerBattCons = 0x52, // TYPE=1(f32) + ID=0x32
-    PowerBattTemp = 0x53, // TYPE=1(f32) + ID=0x33
-    PowerBattSoc = 0x54,  // TYPE=1(f32) + ID=0x34
+    // --- Energia (ids históricos preservados) ---
+    /// Tensão (`f32`).
+    PowerBattV = 0x50,
+    /// Corrente (`f32`).
+    PowerBattI = 0x51,
+    /// Consumo (`f32`).
+    PowerBattCons = 0x52,
+    /// Temperatura (`f32`).
+    PowerBattTemp = 0x53,
+    /// Estado de carga (`f32`).
+    PowerBattSoc = 0x54,
 
-    // Temperatura — Tipo 1 (f32), IDs 0x40-0x45
-    Temp1 = 0x60,         // TYPE=1(f32) + ID=0x40
-    Temp2 = 0x61,         // TYPE=1(f32) + ID=0x41
-    Temp3 = 0x62,         // TYPE=1(f32) + ID=0x42
-    Temp4 = 0x63,         // TYPE=1(f32) + ID=0x43
-    TempEsp1 = 0x64,      // TYPE=1(f32) + ID=0x44
-    TempEsp2 = 0x65,      // TYPE=1(f32) + ID=0x45
+    // --- Temperatura (ids históricos preservados) ---
+    /// Sensor 1 (`f32`).
+    Temp1 = 0x60,
+    /// Sensor 2 (`f32`).
+    Temp2 = 0x61,
+    /// Sensor 3 (`f32`).
+    Temp3 = 0x62,
+    /// Sensor 4 (`f32`).
+    Temp4 = 0x63,
+    /// Ponte 1 (`f32`).
+    TempBridge1 = 0x64,
+    /// Ponte 2 (`f32`).
+    TempBridge2 = 0x65,
 
-    // Sistema — Tipos mistos (u8, u32)
-    SystemState = 0xC0,   // TYPE=6(u8)  + ID=0
-    SystemMode = 0xC1,    // TYPE=6(u8)  + ID=1
-    SystemUptime = 0x82,  // TYPE=4(u32) + ID=2
-    SystemFreeHeap = 0x83, // TYPE=4(u32) + ID=3
-    SystemCpuLoad = 0xC4, // TYPE=6(u8)  + ID=4
-    SystemEsp1Load = 0xC5, // TYPE=6(u8)  + ID=5
-    SystemEsp2Load = 0xC6, // TYPE=6(u8)  + ID=6
+    // --- Sistema ---
+    /// Estado (`u8`).
+    SystemState = 0xC0,
+    /// Modo (`u8`).
+    SystemMode = 0xC1,
+    /// Uptime s (`u32`).
+    SystemUptime = 0x82,
+    /// RAM livre (`u32`).
+    SystemFreeHeap = 0x83,
+    /// Carga CPU % (`u8`).
+    SystemCpuLoad = 0xC4,
+    /// Carga ponte 1 % (`u8`).
+    SystemBridge1Load = 0xC5,
+    /// Carga ponte 2 % (`u8`).
+    SystemBridge2Load = 0xC6,
 
-    // Failsafe — Tipos mistos (u8)
-    FailsafeReason = 0xC8, // TYPE=6(u8) + ID=8
-    FailsafeAction = 0xC9, // TYPE=6(u8) + ID=9
-    FailsafeState = 0xCA,  // TYPE=6(u8) + ID=10
+    // --- Failsafe (`u8`) ---
+    /// Motivo (`u8`).
+    FailsafeReason = 0xC8,
+    /// Ação (`u8`).
+    FailsafeAction = 0xC9,
+    /// Estado (`u8`).
+    FailsafeState = 0xCA,
 
-    // Vídeo — Tipos mistos (u16, u8, raw)
-    VideoFrameId = 0xA0,   // TYPE=5(u16) + ID=0
-    VideoChunkId = 0xC3,   // TYPE=6(u8)  + ID=3
-    VideoTotalChunks = 0xCB, // TYPE=6(u8) + ID=11
-    VideoPayload = 0x00,   // TYPE=0(raw) + ID=0
+    // --- Vídeo ---
+    /// Id da trama (`u16`).
+    VideoFrameId = 0xA0,
+    /// Id do fragmento (`u8`).
+    VideoChunkId = 0xC3,
+    /// Total de fragmentos (`u8`).
+    VideoTotalChunks = 0xCB,
+    /// Carga do fragmento (`raw`, até 128 B).
+    VideoPayload = 0x00,
 }
 
-/// Comandos básicos do sistema.
-///
-/// Faixa de IDs: 0xC0-0xCF.
+/// Comandos básicos do sistema (`0xC0–0xC4`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandBasic {
+    /// Armar atuadores.
     Arm = 0xC0,
+    /// Desarmar atuadores.
     Disarm = 0xC1,
+    /// Mudar de modo.
     SetMode = 0xC2,
+    /// Paragem de emergência.
     EmergencyStop = 0xC3,
+    /// Desligar.
     Shutdown = 0xC4,
 }
 
-/// Comandos de controlo de voo.
-///
-/// Faixa de IDs: 0xD0-0xDF.
+/// Comandos de controlo (`0xD0–0xD5`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandControl {
+    /// Alvo de altitude.
     SetAltTarget = 0xD0,
+    /// Alvo de velocidade.
     SetSpeed = 0xD1,
+    /// Alvo de arfagem.
     SetPitch = 0xD2,
+    /// Alvo de rolamento.
     SetRoll = 0xD3,
+    /// Alvo de guinada.
     SetYaw = 0xD4,
+    /// Alvo de rumo.
     SetHeading = 0xD5,
 }
 
-/// Comandos avançados de diagnóstico.
-///
-/// Faixa de IDs: 0xE0-0xEF.
+/// Comandos avançados (`0xE0–0xE3`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandAdvanced {
+    /// Calibrar sensores.
     SensorCalib = 0xE0,
+    /// Iniciar registo.
     StartLog = 0xE1,
+    /// Parar registo.
     StopLog = 0xE2,
+    /// Pedir tudo.
     GetAll = 0xE3,
 }
 
-/// Comandos de navegação.
-///
-/// Faixa de IDs: 0xF0-0xFF.
+/// Comandos de navegação (`0xF0–0xF2`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandNav {
+    /// Próximos waypoints.
     NextWaypoints = 0xF0,
+    /// Definir ponto de regresso.
     SetReturnPoint = 0xF1,
+    /// Definir posição.
     SetPosition = 0xF2,
 }
 
-/// Unificação de todos os comandos.
+/// Todos os comandos unificados (mesmos valores, um só tipo para o fio).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
+    /// Armar.
     Arm = 0xC0,
+    /// Desarmar.
     Disarm = 0xC1,
+    /// Mudar de modo.
     SetMode = 0xC2,
+    /// Paragem de emergência.
     EmergencyStop = 0xC3,
+    /// Desligar.
     Shutdown = 0xC4,
+    /// Alvo de altitude.
     SetAltTarget = 0xD0,
+    /// Alvo de velocidade.
     SetSpeed = 0xD1,
+    /// Alvo de arfagem.
     SetPitch = 0xD2,
+    /// Alvo de rolamento.
     SetRoll = 0xD3,
+    /// Alvo de guinada.
     SetYaw = 0xD4,
+    /// Alvo de rumo.
     SetHeading = 0xD5,
+    /// Calibrar sensores.
     SensorCalib = 0xE0,
+    /// Iniciar registo.
     StartLog = 0xE1,
+    /// Parar registo.
     StopLog = 0xE2,
+    /// Pedir tudo.
     GetAll = 0xE3,
+    /// Próximos waypoints.
     NextWaypoints = 0xF0,
+    /// Definir ponto de regresso.
     SetReturnPoint = 0xF1,
+    /// Definir posição.
     SetPosition = 0xF2,
 }
 
 // ============================================================================
-// STRUCTS — CAMPOS E MENSAGENS TLV
+// ESTRUTURAS — CAMPOS E MENSAGENS (layout C estável para FFI)
 // ============================================================================
 
-/// Campo TLV (Type-Length-Value) genérico.
+/// Um campo Bythos: identificador com tipo + comprimento + dados.
 ///
-/// Representa um campo individual dentro de uma mensagem Bythos.
-/// O array `data` contém até `MAX_TLV_DATA` bytes de dados.
-///
-/// **Importante:** Este struct utiliza `#[repr(C)]` para garantir layout
-/// compatível com C/C++ através de FFI.
+/// `#[repr(C)]` congela o layout para a FFI não precisar de tradutores: o C usa
+/// a mesma imagem binária. Só os primeiros `len` bytes de `data` são válidos —
+/// invariante mantida pelo construtor e verificada pelo validador.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct TLVField {
-    /// Identificador do tipo do campo (com tipo embutido: [TYPE:3][ID:5]).
+pub struct BythosField {
+    /// Identificador codificado `[TIPO:3][ID:5]`.
     pub id: u8,
-    /// Número de bytes de dados válidos no array `data`.
+    /// Bytes válidos em `data`.
     pub len: u8,
-    /// Dados do campo. Apenas os primeiros `len` bytes são válidos.
-    pub data: [u8; MAX_TLV_DATA],
+    /// Carga (capacidade `MAX_FIELD_DATA`; conteúdo além de `len` é lixo).
+    pub data: [u8; MAX_FIELD_DATA],
 }
 
-impl TLVField {
-    /// Cria um novo campo TLV vazio.
+impl BythosField {
+    /// Campo vazio (id e comprimento a zero).
     pub fn new() -> Self {
         Self {
             id: 0,
             len: 0,
-            data: [0u8; MAX_TLV_DATA],
+            data: [0u8; MAX_FIELD_DATA],
         }
     }
 
-    /// Cria um novo campo TLV com o ID e dados especificados.
-    pub fn with_data(id: u8, data: &[u8]) -> Self {
+    /// Constrói a partir de identificador já codificado e fatia de dados.
+    ///
+    /// Excesso de dados é **recusado** com `None` — a V3 truncava em silêncio
+    /// (`min`), o que escondia telemetria cortada. Falhar alto aqui poupa
+    /// horas de depuração no terreno.
+    pub fn with_data(id: u8, data: &[u8]) -> Option<Self> {
+        if data.len() > MAX_FIELD_DATA {
+            return None;
+        }
         let mut field = Self::new();
         field.id = id;
-        let len = data.len().min(MAX_TLV_DATA);
-        field.len = len as u8;
-        field.data[..len].copy_from_slice(&data[..len]);
-        field
+        field.len = data.len() as u8;
+        field.data[..data.len()].copy_from_slice(data);
+        Some(field)
     }
 
-    /// Cria um campo TLV com tipo e ID separados.
-    pub fn with_type_data(field_type: FieldType, id: u8, data: &[u8]) -> Self {
-        let encoded_id = field_id_encode(field_type as u8, id);
-        Self::with_data(encoded_id, data)
+    /// Constrói a partir de tipo + id lógico (codifica o identificador).
+    pub fn with_type_data(field_type: BythosFieldType, id: u8, data: &[u8]) -> Option<Self> {
+        Self::with_data(bythos_field_id_encode(field_type as u8, id), data)
     }
 
-    /// Retorna o tipo de dado do campo (bits 7-5 do ID).
-    pub fn field_type(&self) -> Option<FieldType> {
-        let (t, _) = field_id_decode(self.id);
-        FieldType::from_u8(t)
+    /// Tipo embutido no identificador (`None` = byte corrompido).
+    pub fn field_type(&self) -> Option<BythosFieldType> {
+        let (t, _) = bythos_field_id_decode(self.id);
+        BythosFieldType::from_u8(t)
     }
 
-    /// Retorna o ID lógico do campo (bits 4-0 do ID).
+    /// Id lógico (bits 4-0).
     pub fn field_id(&self) -> u8 {
-        let (_, id) = field_id_decode(self.id);
+        let (_, id) = bythos_field_id_decode(self.id);
         id
+    }
+
+    /// Vista só-leitura da carga válida.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.len as usize]
     }
 }
 
-impl Default for TLVField {
+impl Default for BythosField {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Campo TLV específico para dados de vídeo.
+/// Campo de vídeo: mesma forma, tampão de 128 B para a carga do fragmento.
 ///
-/// Utiliza `MAX_TLV_VIDEO_DATA` (128 bytes) em vez de `MAX_TLV_DATA` (32 bytes)
-/// para acomodar payloads de vídeo maiores.
-///
-/// **Importante:** Este struct utiliza `#[repr(C)]` para garantir layout
-/// compatível com C/C++ através de FFI.
+/// Existe separado do `BythosField` porque 128 B × 32 campos não cabem na pilha
+/// de um MCU. A mensagem comporta **um** campo destes (ver `MAX_MESSAGE_SIZE`);
+/// o túnel de vídeo (`crate::tunnel`) fragmenta e remonta por cima.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct TLVVideoField {
-    /// Identificador do tipo do campo.
+pub struct BythosVideoField {
+    /// Identificador (normalmente `VideoPayload = 0x00`).
     pub id: u8,
-    /// Número de bytes de dados válidos no array `data`.
+    /// Bytes válidos em `data`.
     pub len: u8,
-    /// Dados do campo de vídeo.
-    pub data: [u8; MAX_TLV_VIDEO_DATA],
+    /// Carga do fragmento.
+    pub data: [u8; MAX_FIELD_VIDEO_DATA],
 }
 
-impl TLVVideoField {
+impl BythosVideoField {
+    /// Campo de vídeo vazio.
     pub fn new() -> Self {
         Self {
             id: 0,
             len: 0,
-            data: [0u8; MAX_TLV_VIDEO_DATA],
+            data: [0u8; MAX_FIELD_VIDEO_DATA],
         }
+    }
+
+    /// Constrói com verificação de limite (recusa, não trunca — ver `with_data`).
+    pub fn with_data(id: u8, data: &[u8]) -> Option<Self> {
+        if data.len() > MAX_FIELD_VIDEO_DATA {
+            return None;
+        }
+        let mut field = Self::new();
+        field.id = id;
+        field.len = data.len() as u8;
+        field.data[..data.len()].copy_from_slice(data);
+        Some(field)
     }
 }
 
-impl Default for TLVVideoField {
+impl Default for BythosVideoField {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Mensagem Bythos completa (v3.0.0).
+/// Mensagem Bythos V4 completa (imagem em memória, não o fio).
 ///
-/// Estrutura principal do protocolo. Contém o cabeçalho Bythos, até `MAX_TLV_FIELDS`
-/// campos TLV, um byte de assinatura e checksum CRC16 para integridade.
-///
-/// Formato na memória:
-/// ```text
-/// [startByte][version][nodeId][msgId][seqNum(2)][tlvCount]
-/// [tlv[0]...tlv[N]][signature][checksum(2)]
-/// ```
-///
-/// **Importante:** Este struct utiliza `#[repr(C)]` para garantir layout
-/// compatível com C/C++ através de FFI. O tamanho total é fixo.
+/// O fio é produzido por `codec::build_message`; esta estrutura é o rascunho
+/// validado antes de selar (a selagem precisa da chave, que vive no cofre —
+/// ver `crate::protocol::secure`). `#[repr(C)]` para partilha direta com C.
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct TLVMessage {
-    /// Byte de início (sempre `START_BYTE` = 0xAA).
+pub struct BythosMessage {
+    /// Sempre `START_BYTE` (âncora de sincronização).
     pub start_byte: u8,
-    /// Versão do protocolo Bythos (0x03).
+    /// Sempre `BYTHOS_VERSION` (`0x04`).
     pub version: u8,
-    /// ID do nó transmissor (grupo CAN).
-    pub node_id: u8,
-    /// Identificador do tipo de mensagem.
+    /// Endereço do emissor no anel (`0` = raiz).
+    pub src: u16,
+    /// Endereço do destino (`0xFFFF` = difusão).
+    pub dst: u16,
+    /// Tipo de mensagem.
     pub msg_id: u8,
-    /// Número de sequência (16 bits, little-endian).
+    /// Sequência do emissor (diagnóstico; anti-replay usa `CTR`, não isto).
     pub seq_num: u16,
-    /// Número de campos TLV válidos na mensagem.
-    pub tlv_count: u8,
-    /// Array de campos TLV. Apenas os primeiros `tlv_count` são válidos.
-    pub tlvs: [TLVField; MAX_TLV_FIELDS],
-    /// Byte de assinatura (XOR key).
-    pub signature: u8,
-    /// Checksum CRC16 de toda a mensagem.
+    /// Nº de campos válidos em `fields`.
+    pub field_count: u8,
+    /// Saltos restantes (decrementado a cada ponte).
+    pub hops: u8,
+    /// Os campos (só os primeiros `field_count` valem).
+    pub fields: [BythosField; MAX_FIELDS],
+    /// Ranhura de chave que selou a trama (`0xFF` = legado).
+    pub key_id: u8,
+    /// Contador monotónico que selou a trama (24 bits úteis).
+    pub ctr: u32,
+    /// Etiqueta de autenticação (válida após selar/analisar).
+    pub tag: [u8; TAG_SIZE],
+    /// CRC16 da trama selada (válido após selar/analisar).
     pub checksum: u16,
 }
 
-impl TLVMessage {
-    /// Cria uma nova mensagem Bythos vazia.
+impl BythosMessage {
+    /// Mensagem vazia com preâmbulo correto e resto a zero.
     pub fn new() -> Self {
         Self {
             start_byte: START_BYTE,
             version: BYTHOS_VERSION,
-            node_id: 0,
+            src: 0,
+            dst: BROADCAST_ADDR,
             msg_id: 0,
             seq_num: 0,
-            tlv_count: 0,
-            tlvs: [TLVField::new(); MAX_TLV_FIELDS],
-            signature: 0,
+            field_count: 0,
+            hops: HOP_DEFAULT,
+            fields: [BythosField::new(); MAX_FIELDS],
+            key_id: 0,
+            ctr: 0,
+            tag: [0u8; TAG_SIZE],
             checksum: 0,
         }
     }
 
-    /// Cria uma nova mensagem Bythos com o ID de mensagem e nó especificados.
-    pub fn with_params(msg_id: u8, node_id: u8) -> Self {
-        Self {
-            start_byte: START_BYTE,
-            version: BYTHOS_VERSION,
-            node_id,
-            msg_id,
-            seq_num: 0,
-            tlv_count: 0,
-            tlvs: [TLVField::new(); MAX_TLV_FIELDS],
-            signature: 0,
-            checksum: 0,
-        }
+    /// Atalho com origem, destino e tipo preenchidos.
+    pub fn with_route(src: u16, dst: u16, msg_id: u8) -> Self {
+        let mut msg = Self::new();
+        msg.src = src;
+        msg.dst = dst;
+        msg.msg_id = msg_id;
+        msg
     }
 
-    /// Limpa a mensagem, redefinindo todos os campos para os valores padrão.
+    /// Repõe o rascunho: preâmbulo correto, resto a zero.
+    ///
+    /// Ao contrário da V3 em C (que zerava `START/VERSION`), aqui o preâmbulo
+    /// sobrevive — um rascunho limpo continua a ser "uma trama", não lixo.
     pub fn clear(&mut self) {
         self.start_byte = START_BYTE;
         self.version = BYTHOS_VERSION;
-        self.node_id = 0;
+        self.src = 0;
+        self.dst = BROADCAST_ADDR;
         self.msg_id = 0;
         self.seq_num = 0;
-        self.tlv_count = 0;
-        for tlv in self.tlvs.iter_mut() {
-            *tlv = TLVField::new();
+        self.field_count = 0;
+        self.hops = HOP_DEFAULT;
+        for field in self.fields.iter_mut() {
+            *field = BythosField::new();
         }
-        self.signature = 0;
+        self.key_id = 0;
+        self.ctr = 0;
+        self.tag = [0u8; TAG_SIZE];
         self.checksum = 0;
+    }
+
+    /// Fatia dos campos válidos (para iterar sem contar à mão).
+    pub fn valid_fields(&self) -> &[BythosField] {
+        &self.fields[..self.field_count as usize]
     }
 }
 
-impl Default for TLVMessage {
+impl Default for BythosMessage {
     fn default() -> Self {
         Self::new()
     }
 }
 
 // ============================================================================
-// FUNÇÕES DE CONVERSÃO DE BYTES (Little-Endian)
+// CONVERSÕES LITTLE-ENDIAN (ordem do fio)
 // ============================================================================
 
-/// Converte um valor f32 para 4 bytes em formato little-endian.
+/// `f32` → 4 bytes LE.
 pub fn float_to_bytes(value: f32) -> [u8; 4] {
     value.to_le_bytes()
 }
 
-/// Converte 4 bytes em formato little-endian para f32.
+/// 4 bytes LE → `f32`.
 pub fn bytes_to_float(bytes: &[u8; 4]) -> f32 {
     f32::from_le_bytes(*bytes)
 }
 
-/// Converte um valor i32 para 4 bytes em formato little-endian.
+/// `f16` (meia precisão, bits IEEE-754) → 2 bytes LE.
+///
+/// Conversão por software com arredondamento para o mais próximo: a V3 declarava
+/// o tipo mas nunca o implementava — aqui fecha-se essa dívida sem tabelas, para
+/// continuar sem alocação e sem dependências.
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as i32;
+    let mant = (bits & 0x3FF) as u32;
+    let f32_bits: u32 = if exp == 0 {
+        // Subnormal ou zero: renormaliza por deslocamento até ao bit implícito.
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut m = mant;
+            let mut e = -14i32;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3FF;
+            (sign << 31) | (((e + 127) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 31 {
+        // Infinito ou NaN: preserva a carga útil do NaN.
+        (sign << 31) | (0xFF << 23) | (mant << 13)
+    } else {
+        // Normal: rebasa o expoente de 15 para 127.
+        (sign << 31) | (((exp + 112) as u32) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// `f32` → `f16` (bits), com saturação para infinito em vez de enrolar.
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 31) & 0x1) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let mant = bits & 0x7FFFFF;
+    if exp > 15 {
+        // Transborda: infinito com o sinal (saturar é mais honesto que enrolar).
+        return (sign << 15) | (0x1F << 10);
+    }
+    if exp < -24 {
+        // Irrepresentável: zero com o sinal.
+        return sign << 15;
+    }
+    if exp < -14 {
+        // Subnormal: desloca a mantissa sem bit implícito.
+        let shift = (-exp - 14) as u32;
+        let m = (mant | 0x800000) >> (shift + 13);
+        return (sign << 15) | (m as u16);
+    }
+    // Normal: rebasa e arredonda (meio-para-cima chega para telemetria).
+    let m = ((mant + 0x1000) >> 13) as u16;
+    let e = (exp + 15) as u16;
+    if m == 0x400 {
+        // O arredondamento transbordou a mantissa: sobe o expoente.
+        return (sign << 15) | ((e + 1) << 10);
+    }
+    (sign << 15) | (e << 10) | (m & 0x3FF)
+}
+
+/// `i32` → 4 bytes LE.
 pub fn int32_to_bytes(value: i32) -> [u8; 4] {
     value.to_le_bytes()
 }
 
-/// Converte 4 bytes em formato little-endian para i32.
+/// 4 bytes LE → `i32`.
 pub fn bytes_to_int32(bytes: &[u8; 4]) -> i32 {
     i32::from_le_bytes(*bytes)
 }
 
-/// Converte um valor u32 para 4 bytes em formato little-endian.
+/// `u32` → 4 bytes LE.
 pub fn uint32_to_bytes(value: u32) -> [u8; 4] {
     value.to_le_bytes()
 }
 
-/// Converte 4 bytes em formato little-endian para u32.
+/// 4 bytes LE → `u32`.
 pub fn bytes_to_uint32(bytes: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*bytes)
 }
 
-/// Converte um valor u16 para 2 bytes em formato little-endian.
+/// `u16` → 2 bytes LE.
 pub fn uint16_to_bytes(value: u16) -> [u8; 2] {
     value.to_le_bytes()
 }
 
-/// Converte 2 bytes em formato little-endian para u16.
+/// 2 bytes LE → `u16`.
 pub fn bytes_to_uint16(bytes: &[u8; 2]) -> u16 {
     u16::from_le_bytes(*bytes)
 }
 
 // ============================================================================
-// FUNÇÕES DE VALIDAÇÃO
+// VALIDAÇÃO DE ALTO NÍVEL
 // ============================================================================
 
-/// Retorna true se o ID da mensagem é válido.
+/// `true` se o tipo de mensagem é conhecido.
 pub fn is_valid_msg_id(id: u8) -> bool {
-    MsgId::is_valid(id)
+    BythosMsgId::is_valid(id)
 }
 
-/// Retorna a prioridade de uma mensagem com base no seu ID e estado de failsafe.
+/// Prioridade efetiva de uma mensagem, com regra de failsafe.
 ///
-/// Se o failsafe estiver ativo, todas as mensagens recebem prioridade SUPER_CRITICAL,
-/// exceto mensagens de debug que ficam em LOW.
+/// Com failsafe ativo, tudo sobe a `SuperCritical` exceto `Debug`, que desce a
+/// `Low` — diagnóstico nunca pode preemptar a própria emergência que o gerou.
+/// Sem failsafe, a tabela fixa abaixo decide (vídeo e debug vão no fundo).
 pub fn get_msg_priority(msg_id: u8, failsafe_active: bool) -> u8 {
     if failsafe_active {
-        return if msg_id == MsgId::Debug as u8 {
-            PriorityLevel::Low as u8
+        return if msg_id == BythosMsgId::Debug as u8 {
+            BythosPriority::Low as u8
         } else {
-            PriorityLevel::SuperCritical as u8
+            BythosPriority::SuperCritical as u8
         };
     }
 
     match msg_id {
-        0x10 => PriorityLevel::Medium as u8,     // Heartbeat
-        0x11 => PriorityLevel::Medium as u8,     // Telemetry
-        0x12 => PriorityLevel::High as u8,       // Command
-        0x13 => PriorityLevel::High as u8,       // ACK
-        0x14 => PriorityLevel::SuperCritical as u8, // Failsafe
-        0x15 => PriorityLevel::Low as u8,        // Debug
-        0x16 => PriorityLevel::Low as u8,        // Video
-        0x17 => PriorityLevel::Medium as u8,     // Shell
-        0x18 => PriorityLevel::Medium as u8,     // SI Data
-        0x19 => PriorityLevel::Medium as u8,     // Watchdog
-        0x1A => PriorityLevel::Medium as u8,     // Ping
-        0x1B => PriorityLevel::High as u8,       // Clock
-        _ => PriorityLevel::Low as u8,
+        0x10 => BythosPriority::Medium as u8,        // Heartbeat
+        0x11 => BythosPriority::Medium as u8,        // Telemetry
+        0x12 => BythosPriority::High as u8,          // Command
+        0x13 => BythosPriority::High as u8,          // Ack
+        0x14 => BythosPriority::SuperCritical as u8, // Failsafe
+        0x15 => BythosPriority::Low as u8,           // Debug
+        0x16 => BythosPriority::Low as u8,           // Video
+        0x17 => BythosPriority::Medium as u8,        // Shell
+        0x18 => BythosPriority::Medium as u8,        // SiData
+        0x19 => BythosPriority::Medium as u8,        // Watchdog
+        0x1A => BythosPriority::Medium as u8,        // Ping
+        0x1B => BythosPriority::High as u8,          // Clock
+        0x1C..=0x1F => BythosPriority::High as u8,   // Gestão do anel
+        _ => BythosPriority::Low as u8,
     }
+}
+
+// ============================================================================
+// IDENTIFICADOR DO BYTHOS BUS (arbitragem — a "cópia" do CAN, em Bythos)
+// ============================================================================
+//
+// Quem conhece CAN reconhece isto de imediato — e essa é a intenção comercial:
+// o Bythos Bus arbitra como o CAN (menor identificador ganha, sem destruir a
+// trama), mas o identificador é 100% Bythos e o fio é o anel, não CAN.
+//
+// ```text
+// BythosBusId (u32):
+//   Bits 31-29: prioridade (3 bits, 0 = mais urgente)
+//   Bits 28-25: grupo funcional (4 bits)
+//   Bits 24-21: espécie de tráfego (4 bits)
+//   Bits 20-5:  posição da origem no anel (16 bits)
+//   Bits 4-0:   reservados (0)
+// ```
+//
+// Convenção herdada do CAN: **valor menor = maior prioridade**. Emergência
+// (`SuperCritical`, grupo `Safety`, espécie `Safety`, origem baixa) produz
+// sempre os menores IDs — ganha qualquer contenção sem configuração.
+//
+// Nota de implementação: o RS-485 não tem dominante/recessivo elétrico como o
+// CAN, por isso a arbitragem é por firmware (CSMA + backoff ordenado por este
+// ID) na ponte, não no cobre. A semântica "menor ganha" é o contrato; o meio
+// é detalhe da ponte (ver `docs/BYTHOS-BUS.md`).
+
+/// Identificador de arbitragem do Bythos Bus (u32, valor menor = mais urgente).
+///
+/// Empacota prioridade + grupo + espécie + origem num inteiro comparável: para
+/// ordenar transmissores basta comparar `u32` — sem tabelas, sem heap, sem
+/// ramificações no caminho quente da contenção.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BythosBusId(pub u32);
+
+impl BythosBusId {
+    /// Reserva dos bits baixos (futuro: sub-prioridade ou CRC curto do emissor).
+    const RESERVED_MASK: u32 = 0x1F;
+
+    /// Constrói com validação estrita (`None` = metadados desconhecidos).
+    ///
+    /// Gamas: prioridade `0–4`, grupo `0x0–0xF`, espécie `0x0–0x8`, origem
+    /// qualquer `u16`. Recusar aqui (comissionamento) em vez de mascarar evita
+    /// dois nós com IDs colidentes por erro de configuração.
+    pub fn new(priority: u8, group: u8, kind: u8, src: u16) -> Option<Self> {
+        if priority > BythosPriority::Low as u8 || group > 0x0F {
+            return None;
+        }
+        let kind_v = BythosKind::from_u8(kind)?;
+        let id = ((priority as u32) << 29)
+            | ((group as u32) << 25)
+            | ((kind_v as u32) << 21)
+            | ((src as u32) << 5);
+        Some(Self(id))
+    }
+
+    /// Prioridade (bits 31-29).
+    pub fn priority(self) -> u8 {
+        ((self.0 >> 29) & 0x07) as u8
+    }
+
+    /// Grupo funcional (bits 28-25).
+    pub fn group(self) -> u8 {
+        ((self.0 >> 25) & 0x0F) as u8
+    }
+
+    /// Espécie de tráfego (bits 24-21).
+    pub fn kind(self) -> u8 {
+        ((self.0 >> 21) & 0x0F) as u8
+    }
+
+    /// Posição da origem (bits 20-5).
+    pub fn src(self) -> u16 {
+        ((self.0 >> 5) & 0xFFFF) as u16
+    }
+
+    /// Bits reservados (devem ser 0; futuro sem quebrar comparação).
+    pub fn reserved(self) -> u8 {
+        (self.0 & Self::RESERVED_MASK) as u8
+    }
+
+    /// Arbitragem: `true` se `self` ganha a `other` (menor valor ganha).
+    ///
+    /// É a regra de ouro do barramento, herdada do CAN: não-destrutiva na
+    /// semântica (a trama perdedora recua e retransmite intacta), ainda que o
+    /// mecanismo seja backoff por firmware e não dominante elétrico.
+    pub fn wins_over(self, other: Self) -> bool {
+        self.0 < other.0
+    }
+
+    /// Deriva o ID diretamente de um endereço + mensagem do fio.
+    ///
+    /// Atalho para a ponte: classifica (`kind_of`) e empacota numa chamada,
+    /// sem o firmware decorar a tabela de espécies.
+    pub fn from_route(
+        src: u16,
+        group: BythosGroup,
+        msg_id: u8,
+        priority: BythosPriority,
+    ) -> Option<Self> {
+        let kind = BythosKind::kind_of(msg_id)?;
+        Self::new(priority as u8, group as u8, kind as u8, src)
+    }
+}
+
+/// Atalho funcional (mesma validação, sem construir o struct primeiro).
+pub fn make_bythos_bus_id(priority: u8, group: u8, kind: u8, src: u16) -> Option<u32> {
+    BythosBusId::new(priority, group, kind, src).map(|id| id.0)
+}
+
+// ============================================================================
+// ALIASES DEPRECADOS V3 → V4 (uma release; depois apagam-se)
+// ============================================================================
+//
+// Migração mecânica: `sed -i 's/TLVBuilder/BythosBuilder/g'` e por aí fora.
+// Cada alias aponta para o nome novo para o código V3 continuar a compilar com
+// avisos durante a transição — sem bifurcar a lógica.
+
+/// Nome V3 de `BythosFieldType`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosFieldType`")]
+pub type FieldType = BythosFieldType;
+/// Nome V3 de `BythosFieldId`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosFieldId`")]
+pub type FieldId = BythosFieldId;
+/// Nome V3 de `BythosField`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosField`")]
+pub type TLVField = BythosField;
+/// Nome V3 de `BythosVideoField`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosVideoField`")]
+pub type TLVVideoField = BythosVideoField;
+/// Nome V3 de `BythosMessage`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosMessage`")]
+pub type TLVMessage = BythosMessage;
+/// Nome V3 de `BythosPriority`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosPriority`")]
+pub type PriorityLevel = BythosPriority;
+/// Nome V3 de `BythosGroup`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosGroup`")]
+pub type CanGroup = BythosGroup;
+/// Nome V3 de `BythosKind`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosKind`")]
+pub type CanMsgType = BythosKind;
+/// Nome V3 de `BythosMsgId`. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `BythosMsgId`")]
+pub type MsgId = BythosMsgId;
+/// Constante V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `MAX_FIELD_DATA`")]
+pub const MAX_TLV_DATA: usize = MAX_FIELD_DATA;
+/// Constante V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `MAX_FIELD_VIDEO_DATA`")]
+pub const MAX_TLV_VIDEO_DATA: usize = MAX_FIELD_VIDEO_DATA;
+/// Constante V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `MAX_FIELDS`")]
+pub const MAX_TLV_FIELDS: usize = MAX_FIELDS;
+/// Constante V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `FIELD_HEADER_SIZE`")]
+pub const TLV_HEADER_SIZE: usize = FIELD_HEADER_SIZE;
+/// Função V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `bythos_field_id_encode`")]
+pub fn field_id_encode(field_type: u8, field_id: u8) -> u8 {
+    bythos_field_id_encode(field_type, field_id)
+}
+/// Função V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `bythos_field_id_decode`")]
+pub fn field_id_decode(field_id: u8) -> (u8, u8) {
+    bythos_field_id_decode(field_id)
+}
+/// Função V3 renomeada. A usar só durante a migração.
+#[deprecated(since = "4.0.0", note = "usar `is_valid_bythos_field_id`")]
+pub fn is_valid_field_id(field_id: u8) -> bool {
+    is_valid_bythos_field_id(field_id)
 }
 
 // ============================================================================
@@ -1158,212 +1678,233 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bythos_constants() {
+    fn test_constantes_v4() {
+        // Estrada nova: cabeçalho 11, sobrecarga 21, máximo 1205.
         assert_eq!(START_BYTE, 0xAA);
-        assert_eq!(BYTHOS_VERSION, 0x03);
-        assert_eq!(BYTHOS_HEADER_SIZE, 7);
+        assert_eq!(BYTHOS_VERSION, 0x04);
+        assert_eq!(BYTHOS_HEADER_SIZE, 11);
+        assert_eq!(SEC_HDR_SIZE, 4);
+        assert_eq!(TAG_SIZE, 4);
         assert_eq!(CRC16_SIZE, 2);
-        assert_eq!(SIGNATURE_SIZE, 1);
-        assert_eq!(BYTHOS_OVERHEAD, 10);
+        assert_eq!(BYTHOS_OVERHEAD, 21);
+        assert_eq!(MAX_MESSAGE_SIZE, 1205);
+        assert_eq!(BROADCAST_ADDR, 0xFFFF);
+        assert_eq!(ROOT_ADDR, 0);
+        assert_eq!(HOP_DEFAULT, 32);
     }
 
     #[test]
-    fn test_msg_id_validity() {
-        assert!(MsgId::is_valid(0x10));
-        assert!(MsgId::is_valid(0x1B));
-        assert!(!MsgId::is_valid(0x00));
-        assert!(!MsgId::is_valid(0x1C));
+    fn test_msg_id_v4_completo() {
+        // Base V3 intacta + 4 do anel.
+        assert!(BythosMsgId::is_valid(0x10));
+        assert!(BythosMsgId::is_valid(0x1B));
+        assert!(BythosMsgId::is_valid(0x1C));
+        assert!(BythosMsgId::is_valid(0x1F));
+        assert!(!BythosMsgId::is_valid(0x00));
+        assert!(!BythosMsgId::is_valid(0x20));
+        assert_eq!(BythosMsgId::Hello as u8, 0x1C);
+        assert_eq!(BythosMsgId::Count as u8, 0x1D);
+        assert_eq!(BythosMsgId::RingOpen as u8, 0x1E);
+        assert_eq!(BythosMsgId::WiringFault as u8, 0x1F);
     }
 
     #[test]
-    fn test_field_type_from_u8() {
-        assert_eq!(FieldType::from_u8(0), Some(FieldType::Raw));
-        assert_eq!(FieldType::from_u8(1), Some(FieldType::Float32));
-        assert_eq!(FieldType::from_u8(7), Some(FieldType::Bool));
-        assert_eq!(FieldType::from_u8(8), None);
-    }
-
-    #[test]
-    fn test_field_type_default_size() {
-        assert_eq!(FieldType::Raw.default_size(), 0);
-        assert_eq!(FieldType::Float32.default_size(), 4);
-        assert_eq!(FieldType::Uint8.default_size(), 1);
-        assert_eq!(FieldType::Bool.default_size(), 1);
+    fn test_tipo_campo() {
+        assert_eq!(BythosFieldType::from_u8(0), Some(BythosFieldType::Raw));
+        assert_eq!(BythosFieldType::from_u8(1), Some(BythosFieldType::Float32));
+        assert_eq!(BythosFieldType::from_u8(7), Some(BythosFieldType::Bool));
+        assert_eq!(BythosFieldType::from_u8(8), None);
+        assert_eq!(BythosFieldType::Float32.default_size(), 4);
+        assert_eq!(BythosFieldType::Raw.default_size(), 0);
     }
 
     #[test]
     fn test_field_id_encode_decode() {
-        // Tipo 1 (f32), ID 6 → FieldID = 0x26
-        let fid = field_id_encode(1, 6);
+        // Tipo 1 (f32), id 6 → 0x26 (valor herdado da V3).
+        let fid = bythos_field_id_encode(1, 6);
         assert_eq!(fid, 0x26);
-        let (t, id) = field_id_decode(fid);
-        assert_eq!(t, 1);
-        assert_eq!(id, 6);
-
-        // Tipo 6 (u8), ID 0 → FieldID = 0xC0
-        let fid = field_id_encode(6, 0);
-        assert_eq!(fid, 0xC0);
-        let (t, id) = field_id_decode(fid);
-        assert_eq!(t, 6);
-        assert_eq!(id, 0);
-
-        // Tipo 0 (raw), ID 0 → FieldID = 0x00
-        let fid = field_id_encode(0, 0);
-        assert_eq!(fid, 0x00);
+        assert_eq!(bythos_field_id_decode(fid), (1, 6));
+        // Tipo 6 (u8), id 0 → 0xC0.
+        assert_eq!(bythos_field_id_encode(6, 0), 0xC0);
+        // Tipo 0 (raw), id 0 → 0x00 (carga vídeo).
+        assert_eq!(bythos_field_id_encode(0, 0), 0x00);
     }
 
     #[test]
-    fn test_can_id_make_extract() {
-        // Prioridade=2(High), Src=0x6(Device5), Dst=0x0(Broadcast), Type=0x0(Data)
-        let can_id = make_can_id(2, 0x6, 0x0, 0x0);
-        assert_eq!(can_id_priority(can_id), 2);
-        assert_eq!(can_id_src_group(can_id), 0x6);
-        assert_eq!(can_id_dst_group(can_id), 0x0);
-        assert_eq!(can_id_msg_type(can_id), 0x0);
-        assert!(!is_safety_bus_id(can_id));
+    fn test_endereco_bythos() {
+        // Rota válida com metadados conhecidos.
+        let route = make_bythos_route(27, 2, 0x2, 0x0, 2).unwrap();
+        assert_eq!(route.0.pos, 27);
+        assert_eq!(route.1.pos, 2);
+        // Grupo/espécie desconhecidos recusam no comissionamento.
+        assert!(make_bythos_route(1, 2, 0x10, 0x0, 2).is_none());
+        assert!(make_bythos_route(1, 2, 0x2, 0x9, 2).is_none());
+        // Difusão e segurança.
+        let bc = BythosAddress::broadcast(BythosKind::Data, BythosPriority::Medium);
+        assert_eq!(bc.pos, BROADCAST_ADDR);
+        let safe = BythosAddress {
+            pos: 4,
+            group: BythosGroup::Safety,
+            kind: BythosKind::Safety,
+            priority: BythosPriority::SuperCritical,
+        };
+        assert!(safe.is_safety());
+        assert!(!bc.is_safety());
     }
 
     #[test]
-    fn test_can_id_safety_bus() {
-        let safety_id = make_can_id(
-            PriorityLevel::SuperCritical as u8,
-            CanGroup::Device3 as u8,
-            CanGroup::Device4 as u8,
-            CanMsgType::Safety as u8,
-        );
-        assert!(is_safety_bus_id(safety_id));
-        let normal_id = make_can_id(
-            PriorityLevel::High as u8,
-            CanGroup::Device5 as u8,
-            CanGroup::None as u8,
-            CanMsgType::Data as u8,
-        );
-        assert!(!is_safety_bus_id(normal_id));
+    fn test_kind_of() {
+        // Classificação sem CAN ID: deriva do MSG.
+        assert_eq!(BythosKind::kind_of(0x11), Some(BythosKind::Data));
+        assert_eq!(BythosKind::kind_of(0x12), Some(BythosKind::Cmd));
+        assert_eq!(BythosKind::kind_of(0x14), Some(BythosKind::Safety));
+        assert_eq!(BythosKind::kind_of(0x1C), Some(BythosKind::Ring));
+        assert_eq!(BythosKind::kind_of(0x1F), Some(BythosKind::Ring));
+        assert_eq!(BythosKind::kind_of(0x20), None);
     }
 
     #[test]
-    fn test_signature_computation() {
-        // key=0x42, msg_id=0x11, seq_lo=0x2A, seq_hi=0x00
-        let sig = compute_signature(0x42, 0x11, 0x2A, 0x00);
-        assert_eq!(sig, 0x42 ^ 0x11 ^ 0x2A ^ 0x00);
-        assert!(validate_signature(sig, 0x42, 0x11, 0x2A, 0x00));
-        assert!(!validate_signature(sig, 0x43, 0x11, 0x2A, 0x00));
+    fn test_etiqueta_legada() {
+        // XOR herdado: só para ler o parque V3 em migração.
+        let tag = compute_legacy_tag(0x42, 0x11, 0x2A, 0x01);
+        assert_eq!(tag, 0x42 ^ 0x11 ^ 0x2A ^ 0x01);
+        assert!(validate_legacy_tag(tag, 0x42, 0x11, 0x2A, 0x01));
+        assert!(!validate_legacy_tag(tag, 0x43, 0x11, 0x2A, 0x01));
     }
 
     #[test]
-    fn test_float_conversion() {
-        let value: f32 = 3.14;
-        let bytes = float_to_bytes(value);
-        let recovered = bytes_to_float(&bytes);
-        assert!((value - recovered).abs() < f32::EPSILON);
+    fn test_conversoes() {
+        // Ida-volta f32/i32/u32/u16.
+        let f: f32 = 2.5;
+        assert!((f - bytes_to_float(&float_to_bytes(f))).abs() < f32::EPSILON);
+        assert_eq!(bytes_to_int32(&int32_to_bytes(-12345)), -12345);
+        assert_eq!(bytes_to_uint32(&uint32_to_bytes(0xDEADBEEF)), 0xDEADBEEF);
+        assert_eq!(bytes_to_uint16(&uint16_to_bytes(0x1234)), 0x1234);
     }
 
     #[test]
-    fn test_int32_conversion() {
-        let value: i32 = -12345;
-        let bytes = int32_to_bytes(value);
-        let recovered = bytes_to_int32(&bytes);
-        assert_eq!(value, recovered);
+    fn test_f16_ida_volta() {
+        // Dívida V3 fechada: f16 funciona por software, sem tabelas.
+        for v in [0.0f32, 1.0, -1.5, 100.25, 0.0001, 65504.0] {
+            let half = f32_to_f16(v);
+            let back = f16_to_f32(half);
+            let tol = v.abs() * 0.002 + 0.001;
+            assert!((v - back).abs() <= tol, "v={v} back={back}");
+        }
+        // Casos especiais: zero com sinal, infinito, NaN.
+        assert_eq!(f16_to_f32(0x8000).to_bits() & 0x8000_0000, 0x8000_0000);
+        assert!(f16_to_f32(0x7C00).is_infinite());
+        assert!(f16_to_f32(0x7E00).is_nan());
+        assert_eq!(f32_to_f16(f32::INFINITY), 0x7C00);
     }
 
     #[test]
-    fn test_uint32_conversion() {
-        let value: u32 = 0xDEADBEEF;
-        let bytes = uint32_to_bytes(value);
-        let recovered = bytes_to_uint32(&bytes);
-        assert_eq!(value, recovered);
+    fn test_campo_recusa_em_vez_de_truncar() {
+        // 33 B num campo normal: recusado (a V3 truncava em silêncio).
+        assert!(BythosField::with_data(0xC0, &[0u8; 33]).is_none());
+        assert!(BythosField::with_data(0xC0, &[0u8; 32]).is_some());
+        // Vídeo aceita até 128.
+        assert!(BythosVideoField::with_data(0x00, &[0u8; 128]).is_some());
+        assert!(BythosVideoField::with_data(0x00, &[0u8; 129]).is_none());
+        // Tipo/id lidos do byte.
+        let f =
+            BythosField::with_type_data(BythosFieldType::Float32, 6, &float_to_bytes(1.5)).unwrap();
+        assert_eq!(f.id, 0x26);
+        assert_eq!(f.field_type(), Some(BythosFieldType::Float32));
+        assert_eq!(f.field_id(), 6);
     }
 
     #[test]
-    fn test_uint16_conversion() {
-        let value: u16 = 0x1234;
-        let bytes = uint16_to_bytes(value);
-        let recovered = bytes_to_uint16(&bytes);
-        assert_eq!(value, recovered);
-    }
-
-    #[test]
-    fn test_tlv_field_new() {
-        let field = TLVField::new();
-        assert_eq!(field.id, 0);
-        assert_eq!(field.len, 0);
-    }
-
-    #[test]
-    fn test_tlv_field_with_data() {
-        let data = [1u8, 2, 3, 4];
-        let field = TLVField::with_data(0xB0, &data);
-        assert_eq!(field.id, 0xB0);
-        assert_eq!(field.len, 4);
-        assert_eq!(field.data[0], 1);
-        assert_eq!(field.data[3], 4);
-    }
-
-    #[test]
-    fn test_tlv_field_with_type_data() {
-        let field = TLVField::with_type_data(FieldType::Float32, 6, &float_to_bytes(1.5));
-        assert_eq!(field.id, 0x26);
-        assert_eq!(field.len, 4);
-        assert_eq!(field.field_type(), Some(FieldType::Float32));
-        assert_eq!(field.field_id(), 6);
-    }
-
-    #[test]
-    fn test_tlv_message_new() {
-        let msg = TLVMessage::new();
+    fn test_mensagem_rascunho() {
+        let mut msg = BythosMessage::with_route(27, 2, 0x11);
+        assert_eq!(msg.src, 27);
+        assert_eq!(msg.dst, 2);
+        assert_eq!(msg.hops, HOP_DEFAULT);
+        assert_eq!(msg.start_byte, START_BYTE);
+        msg.clear();
+        // Limpar repõe preâmbulo e difusão — nunca lixo.
         assert_eq!(msg.start_byte, START_BYTE);
         assert_eq!(msg.version, BYTHOS_VERSION);
-        assert_eq!(msg.tlv_count, 0);
+        assert_eq!(msg.dst, BROADCAST_ADDR);
+        assert_eq!(msg.field_count, 0);
     }
 
     #[test]
-    fn test_tlv_message_with_params() {
-        let msg = TLVMessage::with_params(0x11, 0x06);
-        assert_eq!(msg.msg_id, 0x11);
-        assert_eq!(msg.node_id, 0x06);
+    fn test_prioridade_com_failsafe() {
+        assert_eq!(
+            get_msg_priority(0x14, false),
+            BythosPriority::SuperCritical as u8
+        );
+        assert_eq!(get_msg_priority(0x16, false), BythosPriority::Low as u8);
+        assert_eq!(
+            get_msg_priority(0x10, true),
+            BythosPriority::SuperCritical as u8
+        );
+        // Debug nunca preempta a emergência que o gerou.
+        assert_eq!(get_msg_priority(0x15, true), BythosPriority::Low as u8);
+        // Gestão do anel é urgente.
+        assert_eq!(get_msg_priority(0x1C, false), BythosPriority::High as u8);
     }
 
     #[test]
-    fn test_tlv_message_clear() {
-        let mut msg = TLVMessage::with_params(0x16, 0x06);
-        msg.tlv_count = 3;
-        msg.clear();
-        assert_eq!(msg.tlv_count, 0);
-        assert_eq!(msg.msg_id, 0);
-        assert_eq!(msg.node_id, 0);
+    fn test_grupos_funcionais() {
+        // Nomes de função, valores herdados da V3.
+        assert_eq!(BythosGroup::None as u8, 0x0);
+        assert_eq!(BythosGroup::Control as u8, 0x1);
+        assert_eq!(BythosGroup::Sensors as u8, 0x2);
+        assert_eq!(BythosGroup::Safety as u8, 0x4);
+        assert_eq!(BythosGroup::Vision as u8, 0x6);
+        assert!(BythosGroup::from_u8(0x10).is_none());
     }
 
     #[test]
-    fn test_get_msg_priority_normal() {
-        assert_eq!(get_msg_priority(0x14, false), PriorityLevel::SuperCritical as u8);
-        assert_eq!(get_msg_priority(0x12, false), PriorityLevel::High as u8);
-        assert_eq!(get_msg_priority(0x10, false), PriorityLevel::Medium as u8);
-        assert_eq!(get_msg_priority(0x16, false), PriorityLevel::Low as u8);
-        assert_eq!(get_msg_priority(0x15, false), PriorityLevel::Low as u8);
+    fn test_bus_id_empacota_e_desempacota() {
+        // Ida-volta total dos 4 campos + reserva a zero.
+        let id = BythosBusId::new(2, 0x6, 0x0, 27).unwrap();
+        assert_eq!(id.priority(), 2);
+        assert_eq!(id.group(), 0x6);
+        assert_eq!(id.kind(), 0x0);
+        assert_eq!(id.src(), 27);
+        assert_eq!(id.reserved(), 0);
+        // Layout bit a bit (o contrato com o firmware da ponte; a espécie 0
+        // não desloca nada, por isso não aparece na expressão).
+        assert_eq!(id.0, (2u32 << 29) | (0x6u32 << 25) | (27u32 << 5));
+        // Gamas inválidas recusam no comissionamento, sem mascarar.
+        assert!(BythosBusId::new(5, 0x6, 0x0, 1).is_none());
+        assert!(BythosBusId::new(2, 0x10, 0x0, 1).is_none());
+        assert!(BythosBusId::new(2, 0x6, 0x9, 1).is_none());
+        assert_eq!(make_bythos_bus_id(2, 0x6, 0x0, 27), Some(id.0));
+        assert_eq!(make_bythos_bus_id(9, 0x6, 0x0, 27), None);
     }
 
     #[test]
-    fn test_get_msg_priority_failsafe() {
-        assert_eq!(get_msg_priority(0x10, true), PriorityLevel::SuperCritical as u8);
-        assert_eq!(get_msg_priority(0x15, true), PriorityLevel::Low as u8);
+    fn test_bus_id_menor_ganha_como_no_can() {
+        // Emergência de segurança esmaga telemetria normal — a regra de ouro.
+        let emergencia = BythosBusId::new(0, 0x4, 0x7, 4).unwrap();
+        let telemetria = BythosBusId::new(3, 0x2, 0x0, 27).unwrap();
+        assert!(emergencia.wins_over(telemetria));
+        assert!(!telemetria.wins_over(emergencia));
+        // Em igualdade de urgência, a origem mais baixa desempata (determinístico).
+        let a = BythosBusId::new(2, 0x2, 0x0, 5).unwrap();
+        let b = BythosBusId::new(2, 0x2, 0x0, 6).unwrap();
+        assert!(a.wins_over(b));
+        // Ordenação total: dá para ordenar filas com `<` direto.
+        assert!(emergencia < telemetria);
     }
 
     #[test]
-    fn test_can_group_values() {
-        assert_eq!(CanGroup::None as u8, 0x0);
-        assert_eq!(CanGroup::Device0 as u8, 0x1);
-        assert_eq!(CanGroup::Device1 as u8, 0x2);
-        assert_eq!(CanGroup::Device2 as u8, 0x3);
-        assert_eq!(CanGroup::Device3 as u8, 0x4);
-        assert_eq!(CanGroup::Device4 as u8, 0x5);
-        assert_eq!(CanGroup::Device5 as u8, 0x6);
-    }
-
-    #[test]
-    fn test_can_msg_type_values() {
-        assert_eq!(CanMsgType::Data as u8, 0x0);
-        assert_eq!(CanMsgType::Cmd as u8, 0x1);
-        assert_eq!(CanMsgType::Ack as u8, 0x2);
-        assert_eq!(CanMsgType::Safety as u8, 0x7);
+    fn test_bus_id_da_rota_do_fio() {
+        // Da mensagem real para o ID de arbitragem numa chamada.
+        let id = BythosBusId::from_route(27, BythosGroup::Sensors, 0x11, BythosPriority::Medium)
+            .unwrap();
+        assert_eq!(
+            (id.priority(), id.group(), id.kind(), id.src()),
+            (3, 0x2, 0x0, 27)
+        );
+        // Tipo desconhecido não arbitra (não há espécie, não há fila).
+        assert!(
+            BythosBusId::from_route(27, BythosGroup::Sensors, 0x20, BythosPriority::Medium)
+                .is_none()
+        );
     }
 }

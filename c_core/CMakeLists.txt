@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(bythos_c_core VERSION 3.0.0 LANGUAGES C)
+project(bythos_c_core VERSION 4.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

@@ -1,29 +1,21 @@
 /**
  * @file bythos.h
- * @brief Bythos Protocol v3.0.0 — C/C++ Bindings
+ * @brief Bythos Protocol v4.0.0 — Ligações C
  *
- * Header principal para utilização do protocolo Bythos a partir de C e C++.
- * Fornece funções para construção, validação e parsing de mensagens TLV.
+ * Cabeçalho único para usar o Bythos V4 a partir de C e C++: construção,
+ * selagem (HMAC-SHA256 truncado), validação ponta-a-ponta, análise de campos,
+ * decisão de sentido no anel e COBS para rádios.
  *
- * ## Formato da Mensagem
+ * Nomenclatura exclusivamente Bythos (ver docs/MIGRATION-GUIDE.md):
+ * não há `CAN`, `TLV` nem `DeviceX` nesta API.
  *
- * ```
- * [START_BYTE][VERSION][NODE_ID][MSG_ID][SEQ_NUM(2)][TLV_COUNT]
- * [TLV_FIELDS...][SIGNATURE][CRC16(2)]
- * ```
- *
- * ## Campo TLV — FieldID com Tipo Embutido
- *
- * ```
- * FieldID = [TYPE:3bits][ID:5bits]
- *
- *   Bits 7-5: Tipo de dado (0-7)
- *   Bits 4-0: ID do campo (0-31)
- * ```
+ * Trama V4 no fio:
+ * [INÍCIO:1][VERSÃO:1][ORIGEM:2 LE][DESTINO:2 LE][MSG:1][SEQ:2 LE]
+ * [N_CAMPOS:1][SALTOS:1][CAMPOS...][SEC_HDR:4][TAG:4][CRC16:2 LE]
  *
  * @author ShegaPT
  * @license GPL-3.0
- * @version 3.0.0
+ * @version 4.0.0
  */
 
 #ifndef BYTHOS_H
@@ -31,7 +23,6 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <stdbool.h>
 
 typedef int64_t bythos_ssize_t;
 
@@ -40,109 +31,123 @@ extern "C" {
 #endif
 
 // ============================================================================
-// CONSTANTES
+// CONSTANTES DO FIO (v4.0.0)
 // ============================================================================
 
+/// Âncora de sincronização (primeiro byte de cada trama).
 #define BYTHOS_START_BYTE       0xAA
-#define BYTHOS_VERSION          0x03
-#define BYTHOS_HEADER_SIZE      7
-#define BYTHOS_SIGNATURE_SIZE   1
+/// Versão do fio (a V4 rejeita 0x03 por defeito).
+#define BYTHOS_VERSION          0x04
+/// Cabeçalho: 1+1+2+2+1+2+1+1 = 11 bytes.
+#define BYTHOS_HEADER_SIZE      11
+/// Cabeçalho de segurança: [KEY_ID:1][CTR:3].
+#define BYTHOS_SEC_HDR_SIZE     4
+/// Etiqueta de autenticação (HMAC-SHA256 truncado a 32 bits).
+#define BYTHOS_TAG_SIZE         4
+/// CRC16 no fim da trama.
 #define BYTHOS_CRC16_SIZE       2
-#define BYTHOS_OVERHEAD         10
-#define BYTHOS_MAX_TLV_FIELDS   32
-#define BYTHOS_MAX_TLV_DATA     32
-#define BYTHOS_MAX_MESSAGE_SIZE 1098
-#define BYTHOS_TLV_HEADER_SIZE  2
+/// Sobrecarga total: 11 + 4 + 4 + 2 = 21 bytes.
+#define BYTHOS_OVERHEAD         21
+/// Campos por mensagem (máximo).
+#define BYTHOS_MAX_FIELDS       32
+/// Dados por campo normal (máximo).
+#define BYTHOS_MAX_FIELD_DATA   32
+/// Dados da carga vídeo (máximo; só tipo raw, um por trama).
+#define BYTHOS_MAX_VIDEO_DATA   128
+/// Trama máxima: 11 + 31*34 + 130 + 10 = 1205 bytes.
+#define BYTHOS_MAX_MESSAGE_SIZE 1205
+/// Cabeçalho de cada campo: [FIELD_ID:1][LEN:1].
+#define BYTHOS_FIELD_HEADER_SIZE 2
+/// Chave de selagem (sempre 32 bytes).
+#define BYTHOS_KEY_SIZE         32
+/// Ranhura que marca modo legado V3 (sem TAG real; migração apenas).
+#define BYTHOS_KEY_ID_LEGACY    0xFF
+/// Difusão (destino para todos).
+#define BYTHOS_BROADCAST        0xFFFF
+/// Raiz do anel (único endereço configurável à mão).
+#define BYTHOS_ROOT_ADDR        0x0000
+/// Saltos por defeito.
+#define BYTHOS_HOPS_DEFAULT     32
+/// Teto do COBS: 1205 + teto(1205/254) + 1 = 1211.
+#define BYTHOS_TUNNEL_MAX       1211
 
 // ============================================================================
-// ENUMS — FIELD TYPES (3 bits)
+// TIPOS DE CAMPO (3 bits embutidos no identificador)
 // ============================================================================
 
 typedef enum {
-    BYTHOS_FIELD_RAW      = 0,
-    BYTHOS_FIELD_FLOAT32  = 1,
-    BYTHOS_FIELD_FLOAT16  = 2,
-    BYTHOS_FIELD_INT32    = 3,
-    BYTHOS_FIELD_UINT32   = 4,
-    BYTHOS_FIELD_UINT16   = 5,
-    BYTHOS_FIELD_UINT8    = 6,
-    BYTHOS_FIELD_BOOL     = 7,
+    BYTHOS_FIELD_RAW      = 0, /**< Carga bruta (único até 128 B). */
+    BYTHOS_FIELD_FLOAT32  = 1, /**< Vírgula flutuante 32 bits. */
+    BYTHOS_FIELD_FLOAT16  = 2, /**< Meia precisão (ver bythos_f32_to_f16). */
+    BYTHOS_FIELD_INT32    = 3, /**< Inteiro com sinal 32 bits. */
+    BYTHOS_FIELD_UINT32   = 4, /**< Inteiro sem sinal 32 bits. */
+    BYTHOS_FIELD_UINT16   = 5, /**< Inteiro sem sinal 16 bits. */
+    BYTHOS_FIELD_UINT8    = 6, /**< Inteiro sem sinal 8 bits. */
+    BYTHOS_FIELD_BOOL     = 7  /**< Booleano. */
 } BythosFieldType;
 
 // ============================================================================
-// FIELDID UNIFICADO — Constantes pré-codificadas [TYPE:3][ID:5]
-//
-// Alinhado com o enum Rust FieldId em protocol/types.rs.
-// Cada valor combina o tipo de dado (bits 7-5) e o ID do campo (bits 4-0).
-//
-// Formato: FieldID = (field_type << 5) | field_id
+// CATÁLOGO — IDENTIFICADORES JÁ CODIFICADOS [TIPO:3][ID:5]
 // ============================================================================
+// Valores herdados da V3, intocados; só os nomes são Bythos.
 
-// --- GPS — Tipo 1 (f32), IDs 0x06-0x0C ---
-#define BYTHOS_FIELD_GPS_LATITUDE     0x26  // TYPE=1(f32) + ID=6
-#define BYTHOS_FIELD_GPS_LONGITUDE    0x27  // TYPE=1(f32) + ID=7
-#define BYTHOS_FIELD_GPS_ALTITUDE     0x28  // TYPE=1(f32) + ID=8
-#define BYTHOS_FIELD_GPS_SPEED        0x29  // TYPE=1(f32) + ID=9
-#define BYTHOS_FIELD_GPS_COURSE       0x2A  // TYPE=1(f32) + ID=10
-#define BYTHOS_FIELD_GPS_SATELLITES   0xC7  // TYPE=6(u8)  + ID=7
-#define BYTHOS_FIELD_GPS_HDOP         0x2B  // TYPE=1(f32) + ID=11
+#define BYTHOS_FIELD_GPS_LATITUDE     0x26
+#define BYTHOS_FIELD_GPS_LONGITUDE    0x27
+#define BYTHOS_FIELD_GPS_ALTITUDE     0x28
+#define BYTHOS_FIELD_GPS_SPEED        0x29
+#define BYTHOS_FIELD_GPS_COURSE       0x2A
+#define BYTHOS_FIELD_GPS_SATELLITES   0xC7
+#define BYTHOS_FIELD_GPS_HDOP         0x2B
 
-// --- IMU — Tipo 1 (f32), IDs 0x10-0x19 ---
-#define BYTHOS_FIELD_IMU_ROLL         0x30  // TYPE=1(f32) + ID=0x10
-#define BYTHOS_FIELD_IMU_PITCH        0x31  // TYPE=1(f32) + ID=0x11
-#define BYTHOS_FIELD_IMU_YAW          0x32  // TYPE=1(f32) + ID=0x12
-#define BYTHOS_FIELD_IMU_ACCEL_X      0x33  // TYPE=1(f32) + ID=0x13
-#define BYTHOS_FIELD_IMU_ACCEL_Y      0x34  // TYPE=1(f32) + ID=0x14
-#define BYTHOS_FIELD_IMU_ACCEL_Z      0x35  // TYPE=1(f32) + ID=0x15
-#define BYTHOS_FIELD_IMU_GYRO_X       0x36  // TYPE=1(f32) + ID=0x16
-#define BYTHOS_FIELD_IMU_GYRO_Y       0x37  // TYPE=1(f32) + ID=0x17
-#define BYTHOS_FIELD_IMU_GYRO_Z       0x38  // TYPE=1(f32) + ID=0x18
-#define BYTHOS_FIELD_IMU_YAW_RATE     0x39  // TYPE=1(f32) + ID=0x19
+#define BYTHOS_FIELD_IMU_ROLL         0x30
+#define BYTHOS_FIELD_IMU_PITCH        0x31
+#define BYTHOS_FIELD_IMU_YAW          0x32
+#define BYTHOS_FIELD_IMU_ACCEL_X      0x33
+#define BYTHOS_FIELD_IMU_ACCEL_Y      0x34
+#define BYTHOS_FIELD_IMU_ACCEL_Z      0x35
+#define BYTHOS_FIELD_IMU_GYRO_X       0x36
+#define BYTHOS_FIELD_IMU_GYRO_Y       0x37
+#define BYTHOS_FIELD_IMU_GYRO_Z       0x38
+#define BYTHOS_FIELD_IMU_YAW_RATE     0x39
 
-// --- Voo — Tipo 1 (f32), IDs 0x20-0x24 ---
-#define BYTHOS_FIELD_FLIGHT_ALT_GPS   0x40  // TYPE=1(f32) + ID=0x20
-#define BYTHOS_FIELD_FLIGHT_ALT_BARO  0x41  // TYPE=1(f32) + ID=0x21
-#define BYTHOS_FIELD_FLIGHT_VSPEED    0x42  // TYPE=1(f32) + ID=0x22
-#define BYTHOS_FIELD_FLIGHT_AIRSPEED  0x43  // TYPE=1(f32) + ID=0x23
-#define BYTHOS_FIELD_FLIGHT_LOOPTIME  0xA2  // TYPE=5(u16) + ID=2
+#define BYTHOS_FIELD_FLIGHT_ALT_GPS   0x40
+#define BYTHOS_FIELD_FLIGHT_ALT_BARO  0x41
+#define BYTHOS_FIELD_FLIGHT_VSPEED    0x42
+#define BYTHOS_FIELD_FLIGHT_AIRSPEED  0x43
+#define BYTHOS_FIELD_FLIGHT_LOOPTIME  0xA2
 
-// --- Energia — Tipo 1 (f32), IDs 0x30-0x34 ---
-#define BYTHOS_FIELD_POWER_BATT_V     0x50  // TYPE=1(f32) + ID=0x30
-#define BYTHOS_FIELD_POWER_BATT_I     0x51  // TYPE=1(f32) + ID=0x31
-#define BYTHOS_FIELD_POWER_BATT_CONS  0x52  // TYPE=1(f32) + ID=0x32
-#define BYTHOS_FIELD_POWER_BATT_TEMP  0x53  // TYPE=1(f32) + ID=0x33
-#define BYTHOS_FIELD_POWER_BATT_SOC   0x54  // TYPE=1(f32) + ID=0x34
+#define BYTHOS_FIELD_POWER_BATT_V     0x50
+#define BYTHOS_FIELD_POWER_BATT_I     0x51
+#define BYTHOS_FIELD_POWER_BATT_CONS  0x52
+#define BYTHOS_FIELD_POWER_BATT_TEMP  0x53
+#define BYTHOS_FIELD_POWER_BATT_SOC   0x54
 
-// --- Temperatura — Tipo 1 (f32), IDs 0x40-0x45 ---
-#define BYTHOS_FIELD_TEMP_1           0x60  // TYPE=1(f32) + ID=0x40
-#define BYTHOS_FIELD_TEMP_2           0x61  // TYPE=1(f32) + ID=0x41
-#define BYTHOS_FIELD_TEMP_3           0x62  // TYPE=1(f32) + ID=0x42
-#define BYTHOS_FIELD_TEMP_4           0x63  // TYPE=1(f32) + ID=0x43
-#define BYTHOS_FIELD_TEMP_ESP1        0x64  // TYPE=1(f32) + ID=0x44
-#define BYTHOS_FIELD_TEMP_ESP2        0x65  // TYPE=1(f32) + ID=0x45
+#define BYTHOS_FIELD_TEMP_1           0x60
+#define BYTHOS_FIELD_TEMP_2           0x61
+#define BYTHOS_FIELD_TEMP_3           0x62
+#define BYTHOS_FIELD_TEMP_4           0x63
+#define BYTHOS_FIELD_TEMP_BRIDGE1     0x64
+#define BYTHOS_FIELD_TEMP_BRIDGE2     0x65
 
-// --- Sistema — Tipos mistos (u8, u32) ---
-#define BYTHOS_FIELD_SYSTEM_STATE     0xC0  // TYPE=6(u8)  + ID=0
-#define BYTHOS_FIELD_SYSTEM_MODE      0xC1  // TYPE=6(u8)  + ID=1
-#define BYTHOS_FIELD_SYSTEM_UPTIME    0x82  // TYPE=4(u32) + ID=2
-#define BYTHOS_FIELD_SYSTEM_FREE_HEAP 0x83  // TYPE=4(u32) + ID=3
-#define BYTHOS_FIELD_SYSTEM_CPU_LOAD  0xC4  // TYPE=6(u8)  + ID=4
-#define BYTHOS_FIELD_SYSTEM_ESP1_LOAD 0xC5  // TYPE=6(u8)  + ID=5
-#define BYTHOS_FIELD_SYSTEM_ESP2_LOAD 0xC6  // TYPE=6(u8)  + ID=6
+#define BYTHOS_FIELD_SYSTEM_STATE     0xC0
+#define BYTHOS_FIELD_SYSTEM_MODE      0xC1
+#define BYTHOS_FIELD_SYSTEM_UPTIME    0x82
+#define BYTHOS_FIELD_SYSTEM_FREE_HEAP 0x83
+#define BYTHOS_FIELD_SYSTEM_CPU_LOAD  0xC4
+#define BYTHOS_FIELD_SYSTEM_BRIDGE1_LOAD 0xC5
+#define BYTHOS_FIELD_SYSTEM_BRIDGE2_LOAD 0xC6
 
-// --- Failsafe — Tipo 6 (u8) ---
-#define BYTHOS_FIELD_FAILSAFE_REASON  0xC8  // TYPE=6(u8) + ID=8
-#define BYTHOS_FIELD_FAILSAFE_ACTION  0xC9  // TYPE=6(u8) + ID=9
-#define BYTHOS_FIELD_FAILSAFE_STATE   0xCA  // TYPE=6(u8) + ID=10
+#define BYTHOS_FIELD_FAILSAFE_REASON  0xC8
+#define BYTHOS_FIELD_FAILSAFE_ACTION  0xC9
+#define BYTHOS_FIELD_FAILSAFE_STATE   0xCA
 
-// --- Vídeo — Tipos mistos (u16, u8, raw) ---
-#define BYTHOS_FIELD_VIDEO_FRAME_ID   0xA0  // TYPE=5(u16) + ID=0
-#define BYTHOS_FIELD_VIDEO_CHUNK_ID   0xC3  // TYPE=6(u8)  + ID=3
-#define BYTHOS_FIELD_VIDEO_TOTAL_CHUNKS 0xCB // TYPE=6(u8) + ID=11
-#define BYTHOS_FIELD_VIDEO_PAYLOAD    0x00  // TYPE=0(raw) + ID=0
+#define BYTHOS_FIELD_VIDEO_FRAME_ID   0xA0
+#define BYTHOS_FIELD_VIDEO_CHUNK_ID   0xC3
+#define BYTHOS_FIELD_VIDEO_TOTAL_CHUNKS 0xCB
+#define BYTHOS_FIELD_VIDEO_PAYLOAD    0x00
 
 // ============================================================================
-// ENUMS — MSG IDs
+// TIPOS DE MENSAGEM (0x10-0x1F; 0x1C-0x1F nascem com o anel)
 // ============================================================================
 
 typedef enum {
@@ -158,48 +163,53 @@ typedef enum {
     BYTHOS_MSG_WATCHDOG   = 0x19,
     BYTHOS_MSG_PING       = 0x1A,
     BYTHOS_MSG_CLOCK      = 0x1B,
+    BYTHOS_MSG_HELLO      = 0x1C, /**< Enumeração (posição). Novo V4. */
+    BYTHOS_MSG_COUNT      = 0x1D, /**< Enumeração (total N). Novo V4. */
+    BYTHOS_MSG_RING_OPEN  = 0x1E, /**< Anel partido. Novo V4. */
+    BYTHOS_MSG_WIRING_FAULT = 0x1F /**< Erro de cablagem. Novo V4. */
 } BythosMsgId;
 
 // ============================================================================
-// ENUMS — CAN GROUPS
+// GRUPOS BYTHOS (papel funcional — nomes de função, valores V3)
 // ============================================================================
 
 typedef enum {
-    BYTHOS_GROUP_NONE     = 0x0,
-    BYTHOS_GROUP_DEVICE0  = 0x1,
-    BYTHOS_GROUP_DEVICE1  = 0x2,
-    BYTHOS_GROUP_DEVICE2  = 0x3,
-    BYTHOS_GROUP_DEVICE3  = 0x4,
-    BYTHOS_GROUP_DEVICE4  = 0x5,
-    BYTHOS_GROUP_DEVICE5  = 0x6,
-    BYTHOS_GROUP_DEVICE6  = 0x7,
-    BYTHOS_GROUP_DEVICE7  = 0x8,
-    BYTHOS_GROUP_DEVICE8  = 0x9,
-    BYTHOS_GROUP_DEVICE9  = 0xA,
-    BYTHOS_GROUP_DEVICE10 = 0xB,
-    BYTHOS_GROUP_DEVICE11 = 0xC,
-    BYTHOS_GROUP_DEVICE12 = 0xD,
-    BYTHOS_GROUP_DEVICE13 = 0xE,
-    BYTHOS_GROUP_DEVICE14 = 0xF,
-} BythosCanGroup;
+    BYTHOS_GROUP_NONE      = 0x0,
+    BYTHOS_GROUP_CONTROL   = 0x1, /**< Orquestração central. */
+    BYTHOS_GROUP_SENSORS   = 0x2, /**< Aquisição de sensores. */
+    BYTHOS_GROUP_ACTUATORS = 0x3, /**< Controlo de atuadores. */
+    BYTHOS_GROUP_SAFETY    = 0x4, /**< Supervisão de segurança. */
+    BYTHOS_GROUP_EMERGENCY = 0x5, /**< Resposta a emergência. */
+    BYTHOS_GROUP_VISION    = 0x6, /**< Visão por computador. */
+    BYTHOS_GROUP_AUX7      = 0x7,
+    BYTHOS_GROUP_AUX8      = 0x8,
+    BYTHOS_GROUP_AUX9      = 0x9,
+    BYTHOS_GROUP_AUX10     = 0xA,
+    BYTHOS_GROUP_AUX11     = 0xB,
+    BYTHOS_GROUP_AUX12     = 0xC,
+    BYTHOS_GROUP_AUX13     = 0xD,
+    BYTHOS_GROUP_AUX14     = 0xE,
+    BYTHOS_GROUP_AUX15     = 0xF
+} BythosGroup;
 
 // ============================================================================
-// ENUMS — CAN MSG TYPES
+// ESPÉCIES DE TRÁFEGO (natureza — deriva-se do MSG, sem CAN ID)
 // ============================================================================
 
 typedef enum {
-    BYTHOS_CAN_DATA   = 0x0,
-    BYTHOS_CAN_CMD    = 0x1,
-    BYTHOS_CAN_ACK    = 0x2,
-    BYTHOS_CAN_EVENT  = 0x3,
-    BYTHOS_CAN_SYNC   = 0x4,
-    BYTHOS_CAN_STATE  = 0x5,
-    BYTHOS_CAN_HEART  = 0x6,
-    BYTHOS_CAN_SAFETY = 0x7,
-} BythosCanMsgType;
+    BYTHOS_KIND_DATA   = 0x0,
+    BYTHOS_KIND_CMD    = 0x1,
+    BYTHOS_KIND_ACK    = 0x2,
+    BYTHOS_KIND_EVENT  = 0x3,
+    BYTHOS_KIND_SYNC   = 0x4,
+    BYTHOS_KIND_STATE  = 0x5,
+    BYTHOS_KIND_HEART  = 0x6,
+    BYTHOS_KIND_SAFETY = 0x7,
+    BYTHOS_KIND_RING   = 0x8 /**< Gestão do anel. Novo V4. */
+} BythosKind;
 
 // ============================================================================
-// ENUMS — PRIORITY LEVELS
+// PRIORIDADES
 // ============================================================================
 
 typedef enum {
@@ -207,11 +217,11 @@ typedef enum {
     BYTHOS_PRIORITY_CRITICAL       = 1,
     BYTHOS_PRIORITY_HIGH           = 2,
     BYTHOS_PRIORITY_MEDIUM         = 3,
-    BYTHOS_PRIORITY_LOW            = 4,
+    BYTHOS_PRIORITY_LOW            = 4
 } BythosPriorityLevel;
 
 // ============================================================================
-// ENUMS — SYSTEM STATE
+// SISTEMA / VOO / FAILSAFE (cargas úteis — inalterados da V3)
 // ============================================================================
 
 typedef enum {
@@ -222,12 +232,8 @@ typedef enum {
     BYTHOS_STATE_IN_FLIGHT    = 4,
     BYTHOS_STATE_LANDING      = 5,
     BYTHOS_STATE_ERROR        = 6,
-    BYTHOS_STATE_SHUTDOWN     = 7,
+    BYTHOS_STATE_SHUTDOWN     = 7
 } BythosSystemState;
-
-// ============================================================================
-// ENUMS — FLIGHT MODE (UAV/UAS)
-// ============================================================================
 
 typedef enum {
     BYTHOS_FLIGHT_MANUAL    = 0,
@@ -235,12 +241,8 @@ typedef enum {
     BYTHOS_FLIGHT_ALT_HOLD  = 2,
     BYTHOS_FLIGHT_AUTO      = 3,
     BYTHOS_FLIGHT_GUIDED    = 4,
-    BYTHOS_FLIGHT_RTL       = 5,
+    BYTHOS_FLIGHT_RTL       = 5
 } BythosFlightMode;
-
-// ============================================================================
-// ENUMS — FAILSAFE
-// ============================================================================
 
 typedef enum {
     BYTHOS_FAILSAFE_NONE           = 0,
@@ -248,7 +250,7 @@ typedef enum {
     BYTHOS_FAILSAFE_LOW_BATTERY    = 2,
     BYTHOS_FAILSAFE_GPS_LOST       = 3,
     BYTHOS_FAILSAFE_SENSOR_FAILURE = 4,
-    BYTHOS_FAILSAFE_MANUAL_TRIGGER = 5,
+    BYTHOS_FAILSAFE_MANUAL_TRIGGER = 5
 } BythosFailsafeReason;
 
 typedef enum {
@@ -257,371 +259,289 @@ typedef enum {
     BYTHOS_FAILSAFE_ACTION_LAND     = 2,
     BYTHOS_FAILSAFE_ACTION_RTL      = 3,
     BYTHOS_FAILSAFE_ACTION_CONTINUE = 4,
-    BYTHOS_FAILSAFE_ACTION_DISARM   = 5,
+    BYTHOS_FAILSAFE_ACTION_DISARM   = 5
 } BythosFailsafeAction;
 
 // ============================================================================
-// STRUCTS
+// ESTRUTURAS
 // ============================================================================
 
-/**
- * @brief Campo TLV (Type-Length-Value).
- *
- * FieldID contém tipo embutido: [TYPE:3][ID:5]
- */
+/** Um campo Bythos: identificador com tipo + comprimento + dados. */
 typedef struct {
-    uint8_t id;                    ///< FieldID codificado [TYPE:3][ID:5]
-    uint8_t len;                   ///< Número de bytes de dados
-    uint8_t data[BYTHOS_MAX_TLV_DATA]; ///< Dados do campo
-} BythosTLVField;
+    uint8_t id;                             /**< Identificador [TIPO:3][ID:5]. */
+    uint8_t len;                            /**< Bytes válidos em `data`. */
+    uint8_t data[BYTHOS_MAX_FIELD_DATA];    /**< Carga (só `len` bytes valem). */
+} BythosField;
 
-/**
- * @brief Mensagem Bythos completa.
- *
- * Representa uma mensagem Bythos com todos os campos necessários
- * para serialização e validação.
- */
+/** Rascunho de mensagem V4 (imagem em memória; o fio nasce em `bythos_build`). */
 typedef struct {
-    uint8_t start_byte;            ///< Byte de início (0xAA)
-    uint8_t version;               ///< Versão do protocolo (0x03)
-    uint8_t node_id;               ///< ID do grupo CAN deste nó
-    uint8_t msg_id;                ///< ID do tipo de mensagem
-    uint16_t seq_num;              ///< Número de sequência (16 bits)
-    uint8_t tlv_count;             ///< Número de campos TLV
-    BythosTLVField tlvs[BYTHOS_MAX_TLV_FIELDS]; ///< Campos TLV
-    uint8_t signature;             ///< Assinatura XOR
-    uint16_t checksum;             ///< Checksum CRC16
+    uint8_t start_byte;                     /**< Sempre 0xAA. */
+    uint8_t version;                        /**< Sempre 0x04. */
+    uint16_t src;                           /**< Origem no anel. */
+    uint16_t dst;                           /**< Destino (0xFFFF = difusão). */
+    uint8_t msg_id;                         /**< Tipo de mensagem. */
+    uint16_t seq_num;                       /**< Sequência (diagnóstico). */
+    uint8_t field_count;                    /**< Campos válidos em `fields`. */
+    uint8_t hops;                           /**< Saltos restantes. */
+    BythosField fields[BYTHOS_MAX_FIELDS];  /**< Os campos. */
+    uint8_t key_id;                         /**< Ranhura que selou (após build). */
+    uint32_t ctr;                           /**< Contador que selou (24 úteis). */
+    uint8_t tag[BYTHOS_TAG_SIZE];           /**< Etiqueta (após build). */
+    uint16_t checksum;                      /**< CRC16 (após build). */
 } BythosMessage;
 
+/** Tabela anti-replay (8 emissores, sem heap; o firmware reserva-a estática). */
+typedef struct {
+    uint16_t src[8];        /**< Emissor de cada ranhura. */
+    uint8_t key_id[8];      /**< Ranhura de chave. */
+    uint32_t last[8];       /**< Último CTR aceite (24 bits). */
+    uint64_t mask[8];       /**< Janela dos 64 anteriores. */
+    uint8_t used[8];        /**< Ranhura ocupada. */
+    uint8_t seen[8];        /**< Já aceitou alguma trama. */
+    uint32_t stamps[8];     /**< Relógio LRU para despejo. */
+    uint32_t tick;          /**< Relógio global. */
+} BythosPeers;
+
 // ============================================================================
-// FFI — CRC
+// CÓDIGOS DE ERRO (espelham ProtocolError do Rust, sem colapsar)
 // ============================================================================
 
-/**
- * Calcula CRC-16/CCITT de um array de bytes.
- *
- * @param data  Ponteiro para os dados
- * @param len   Número de bytes
- * @return      Valor CRC-16 (0x0000-0xFFFF)
- */
+typedef enum {
+    BYTHOS_OK = 0,
+    BYTHOS_ERR_BUFFER = -1,   /**< Tampão curto ou nulo. */
+    BYTHOS_ERR_FIELDS = -2,   /**< Demasiados campos. */
+    BYTHOS_ERR_START = -3,    /**< Sem âncora 0xAA. */
+    BYTHOS_ERR_VERSION = -4,  /**< Versão recusada. */
+    BYTHOS_ERR_MSG = -5,      /**< Tipo desconhecido. */
+    BYTHOS_ERR_COUNT = -6,    /**< Contagem acima do teto. */
+    BYTHOS_ERR_LEN = -7,      /**< Comprimento de campo inválido. */
+    BYTHOS_ERR_CRC = -8,      /**< CRC não bate. */
+    BYTHOS_ERR_TAG = -9,      /**< TAG não bate. */
+    BYTHOS_ERR_REPLAY = -10,  /**< CTR repetido/fora da janela. */
+    BYTHOS_ERR_HOPS = -11,    /**< Saltos esgotados. */
+    BYTHOS_ERR_KEY = -12      /**< Chave/ranhura desconhecida. */
+} BythosStatus;
+
+// ============================================================================
+// SHA-256 + HMAC (software puro; produção usa o ATECC608 via driver)
+// ============================================================================
+
+/** SHA-256 de `data` (32 bytes em `out`). */
+void bythos_sha256(const uint8_t* data, size_t len, uint8_t out[32]);
+
+/** HMAC-SHA256 completo (32 bytes em `out`). */
+void bythos_hmac_sha256(const uint8_t* key, size_t key_len,
+                        const uint8_t* msg, size_t msg_len, uint8_t out[32]);
+
+/** TAG V4 (4 bytes em `tag_out`); 0 = ok, -1 = erro. */
+int8_t bythos_tag_compute(const uint8_t key[32], uint32_t ctr,
+                          const uint8_t* covered, size_t covered_len,
+                          uint8_t tag_out[4]);
+
+/** Verifica o TAG em tempo constante (1 = válido). */
+uint8_t bythos_tag_verify(const uint8_t key[32], uint32_t ctr,
+                          const uint8_t* covered, size_t covered_len,
+                          const uint8_t tag[4]);
+
+/** Etiqueta XOR legada V3 (migração apenas). */
+uint8_t bythos_legacy_tag_compute(uint8_t key, uint8_t msg_id, uint8_t seq_lo, uint8_t seq_hi);
+
+/** Verifica a etiqueta legada (1 = válida). */
+uint8_t bythos_legacy_tag_validate(uint8_t tag, uint8_t key, uint8_t msg_id,
+                                   uint8_t seq_lo, uint8_t seq_hi);
+
+// ============================================================================
+// CRC
+// ============================================================================
+
+/** CRC-16/CCITT (0xFFFF em nulo/vazio). */
 uint16_t bythos_calc_crc16(const uint8_t* data, size_t len);
 
-/**
- * Calcula CRC-8/SMBUS de um array de bytes (legado).
- *
- * @param data  Ponteiro para os dados
- * @param len   Número de bytes
- * @return      Valor CRC-8 (0x00-0xFF)
- */
+/** CRC-8/SMBUS legado (migração). */
 uint8_t bythos_calc_crc8(const uint8_t* data, size_t len);
 
 // ============================================================================
-// FFI — ASSINATURA
+// IDENTIFICADOR DE CAMPO
 // ============================================================================
 
-/**
- * Calcula a assinatura de uma mensagem Bythos.
- * signature = XOR(key, msg_id, seq_lo, seq_hi)
- *
- * @param key     Chave partilhada
- * @param msg_id  ID da mensagem
- * @param seq_lo  Byte baixo do SEQ_NUM
- * @param seq_hi  Byte alto do SEQ_NUM
- * @return        Byte de assinatura (0x00-0xFF)
- */
-uint8_t bythos_signature_compute(uint8_t key, uint8_t msg_id, uint8_t seq_lo, uint8_t seq_hi);
-
-/**
- * Valida a assinatura de uma mensagem Bythos.
- *
- * @param signature  Assinatura recebida
- * @param key        Chave partilhada
- * @param msg_id     ID da mensagem
- * @param seq_lo     Byte baixo do SEQ_NUM
- * @param seq_hi     Byte alto do SEQ_NUM
- * @return           1 se válida, 0 caso contrário
- */
-uint8_t bythos_signature_validate(uint8_t signature, uint8_t key, uint8_t msg_id, uint8_t seq_lo, uint8_t seq_hi);
-
-// ============================================================================
-// FFI — FIELDID COM TIPO
-// ============================================================================
-
-/**
- * Codifica um FieldID com tipo embutido.
- * FieldID = [TYPE:3][ID:5]
- *
- * @param field_type  Tipo de dado (0-7)
- * @param field_id    ID do campo (0-31)
- * @return            FieldID codificado, ou 0xFF em erro
- */
+/** Codifica [TIPO:3][ID:5]; 0xFF se tipo > 7 ou id > 31. */
 uint8_t bythos_field_id_encode(uint8_t field_type, uint8_t field_id);
 
-/**
- * Decodifica um FieldID nos seus componentes.
- *
- * @param field_id  FieldID codificado
- * @param type_out  Ponteiro para o tipo de dado (output)
- * @param id_out    Ponteiro para o ID do campo (output)
- */
+/** Decodifica nos componentes (nulos = sem efeito). */
 void bythos_field_id_decode(uint8_t field_id, uint8_t* type_out, uint8_t* id_out);
 
-/**
- * Valida se um FieldID codificado tem um tipo válido.
- *
- * @param field_id  FieldID codificado
- * @return          1 se válido, 0 caso contrário
- */
+/** Valida o tipo embutido (1 = válido). */
 uint8_t bythos_field_id_valid(uint8_t field_id);
 
 // ============================================================================
-// FFI — CAN ID
+// IDENTIFICADOR DO BYTHOS BUS (arbitragem — a "cópia" do CAN, em Bythos)
+// ============================================================================
+//
+// Layout u32: [PRIO:3][GRUPO:4][ESPÉCIE:4][ORIGEM:16][RES:5].
+// Valor menor = maior prioridade (convenção CAN: o menor ganha sem colisão).
+// O RS-485 arbitra por firmware (backoff ordenado), não por dominante
+// elétrico — a semântica "menor ganha" é o contrato (ver docs/BYTHOS-BUS.md).
+
+/** Empacota o ID de arbitragem; 0 = metadados inválidos (validar antes). */
+uint32_t bythos_bus_id_make(uint8_t priority, uint8_t group, uint8_t kind, uint16_t src);
+
+/** Prioridade (bits 31-29). */
+uint8_t bythos_bus_id_priority(uint32_t id);
+
+/** Grupo funcional (bits 28-25). */
+uint8_t bythos_bus_id_group(uint32_t id);
+
+/** Espécie de tráfego (bits 24-21). */
+uint8_t bythos_bus_id_kind(uint32_t id);
+
+/** Origem no anel (bits 20-5). */
+uint16_t bythos_bus_id_src(uint32_t id);
+
+/** 1 se `a` ganha a `b` (menor valor ganha, como no CAN). */
+uint8_t bythos_bus_id_wins(uint32_t a, uint32_t b);
+
+// ============================================================================
+// ENDEREÇAMENTO (sem CAN ID na V4)
+// ============================================================================
+
+/** Espécie a partir do MSG (0xFF = desconhecido). */
+uint8_t bythos_kind_of(uint8_t msg_id);
+
+/** 1 se o grupo funcional é conhecido. */
+uint8_t bythos_group_valid(uint8_t group);
+
+/** 1 se a espécie é a de segurança. */
+uint8_t bythos_is_safety_kind(uint8_t kind);
+
+/** Sentido no anel: 0 = AFTER (frente), 1 = BEFORE (trás), 2 = local. */
+uint8_t bythos_ring_decide(uint16_t me, uint16_t total, uint16_t dst);
+
+// ============================================================================
+// CONSTRUÇÃO E VALIDAÇÃO
 // ============================================================================
 
 /**
- * Constrói um CAN ID extended (29-bit).
+ * Sela e serializa (devolve bytes escritos, -1 em erro).
  *
- * Formato:
- *   Bits 28-26: Prioridade (3 bits)
- *   Bits 25-22: Grupo origem (4 bits)
- *   Bits 21-18: Grupo destino (4 bits)
- *   Bits 17-14: Tipo mensagem (4 bits)
- *   Bits 13-0:  Reservado (14 bits)
- *
- * @param priority   Nível de prioridade (0-4)
- * @param src_group  Grupo de origem (0x0-0xF)
- * @param dst_group  Grupo de destino (0x0=broadcast)
- * @param msg_type   Tipo de mensagem (0x0-0x7)
- * @return           CAN ID de 29 bits
+ * @param msg     Rascunho (campos + origem + sequência + saltos).
+ * @param msg_id  Tipo (sobrepõe o rascunho).
+ * @param dst     Destino (sobrepõe o rascunho).
+ * @param key_id  Ranhura de chave (0-253).
+ * @param ctr     Contador monotónico (só 24 bits viajam).
+ * @param key     Chave de 32 bytes (nunca nula).
  */
-uint32_t bythos_can_id_make(uint8_t priority, uint8_t src_group, uint8_t dst_group, uint8_t msg_type);
+bythos_ssize_t bythos_build(const BythosMessage* msg, uint8_t msg_id, uint16_t dst,
+                            uint8_t key_id, uint32_t ctr, const uint8_t key[32],
+                            uint8_t* buffer, size_t buffer_size);
 
-/**
- * Extrai a prioridade de um CAN ID extended.
- */
-uint8_t bythos_can_id_priority(uint32_t can_id);
+/** Só estrutura + CRC (para encaminhar sem chaves); nº de campos ou 0xFF. */
+uint8_t bythos_peek(const uint8_t* buffer, size_t length);
 
-/**
- * Extrai o grupo de origem de um CAN ID extended.
- */
-uint8_t bythos_can_id_src(uint32_t can_id);
+/** Ponta-a-ponta (TAG + replay); nº de campos ou 0xFF. */
+uint8_t bythos_validate(const uint8_t* buffer, size_t length,
+                        const uint8_t key[32], BythosPeers* peers);
 
-/**
- * Extrai o grupo de destino de um CAN ID extended.
- */
-uint8_t bythos_can_id_dst(uint32_t can_id);
+/** Zera a tabela anti-replay (comissionamento / troca de chave). */
+void bythos_peers_clear(BythosPeers* peers);
 
-/**
- * Extrai o tipo de mensagem de um CAN ID extended.
- */
-uint8_t bythos_can_id_type(uint32_t can_id);
-
-/**
- * Verifica se o CAN ID pertence ao bus de segurança.
- */
-uint8_t bythos_is_safety_bus(uint32_t can_id);
+/** Desserializa campos; `*count`: entrada = capacidade, saída = lidos (0 em erro). */
+void bythos_parse_fields(const uint8_t* data, size_t length,
+                         BythosField* output, size_t* count);
 
 // ============================================================================
-// FFI — SERIALIZAÇÃO
+// CAMPOS
 // ============================================================================
 
-/**
- * Serializa uma mensagem Bythos completa num buffer de saída.
- *
- * @param msg           Mensagem a serializar
- * @param msg_id        Identificador do tipo de mensagem
- * @param signature_key Chave de assinatura
- * @param buffer        Buffer de saída
- * @param buffer_size   Tamanho do buffer de saída
- * @return              Número de bytes escritos, ou -1 em erro
- */
-bythos_ssize_t bythos_build(const BythosMessage* msg, uint8_t msg_id, uint8_t signature_key,
-                           uint8_t* buffer, size_t buffer_size);
+/** Adiciona carga bruta (0 = ok, -1 = erro; nunca trunca). */
+int8_t bythos_field_add(BythosMessage* msg, uint8_t id, const uint8_t* data, uint8_t len);
 
-/**
- * Valida a integridade e estrutura de uma mensagem Bythos serializada.
- *
- * @param buffer  Mensagem serializada
- * @param length  Tamanho da mensagem em bytes
- * @return        Número de campos TLV válidos, ou 0xFF em erro
- */
-/**
- * Valida uma mensagem Bythos completa num buffer.
- *
- * Verifica: byte de início, versão, msg_id, tlv_count,
- * integridade dos campos TLV (bounds e tamanhos) e CRC16.
- *
- * @param buffer  Buffer contendo a mensagem
- * @param length  Tamanho do buffer
- * @return        tlv_count se válido, 0xFF em erro
- */
-uint8_t bythos_validate(const uint8_t* buffer, size_t length);
+/** Adiciona f32. */
+int8_t bythos_field_add_f32(BythosMessage* msg, uint8_t id, float value);
 
-/**
- * Valida a assinatura de uma mensagem Bythos serializada.
- *
- * @param buffer         Mensagem serializada
- * @param length         Tamanho da mensagem em bytes
- * @param signature_key  Chave de assinatura esperada
- * @return               1 se válida, 0 caso contrário
- */
-uint8_t bythos_validate_signature(const uint8_t* buffer, size_t length, uint8_t signature_key);
+/** Adiciona f16 (meia precisão, 2 bytes). Novo V4. */
+int8_t bythos_field_add_f16(BythosMessage* msg, uint8_t id, float value);
 
-/**
- * Deserializa campos TLV de um buffer de bytes brutos.
- *
- * @param data    Bytes dos campos TLV
- * @param length  Tamanho dos dados em bytes
- * @param output  Array de saída de BythosTLVField
- * @param count   [input] Capacidade do array, [output] Número de campos real
- */
-void bythos_parse_tlv(const uint8_t* data, size_t length, BythosTLVField* output, size_t* count);
+/** Adiciona i32. */
+int8_t bythos_field_add_i32(BythosMessage* msg, uint8_t id, int32_t value);
+
+/** Adiciona u32. */
+int8_t bythos_field_add_u32(BythosMessage* msg, uint8_t id, uint32_t value);
+
+/** Adiciona u16. */
+int8_t bythos_field_add_u16(BythosMessage* msg, uint8_t id, uint16_t value);
+
+/** Adiciona u8. */
+int8_t bythos_field_add_u8(BythosMessage* msg, uint8_t id, uint8_t value);
+
+/** Adiciona booleano. Novo V4. */
+int8_t bythos_field_add_bool(BythosMessage* msg, uint8_t id, uint8_t value);
 
 // ============================================================================
-// FFI — ADICIONAR CAMPOS TLV
+// INICIALIZAÇÃO
 // ============================================================================
 
-/**
- * Adiciona um campo TLV com dados brutos a uma mensagem.
- *
- * @param msg  Mensagem Bythos
- * @param id   FieldID codificado
- * @param data Dados do campo
- * @param len  Número de bytes de dados
- * @return     0 em sucesso, -1 em erro
- */
-int8_t bythos_tlv_add(BythosMessage* msg, uint8_t id, const uint8_t* data, uint8_t len);
+/** Prepara o rascunho com origem e tipo (inválidos = sem efeito). */
+void bythos_init(BythosMessage* msg, uint16_t src, uint8_t msg_id);
 
-/**
- * Adiciona um campo TLV com valor float (f32).
- * @return 0 em sucesso, -1 em erro
- */
-int8_t bythos_tlv_add_f32(BythosMessage* msg, uint8_t id, float value);
+/** Define o destino (0xFFFF = difusão). */
+void bythos_set_dst(BythosMessage* msg, uint16_t dst);
 
-/**
- * Adiciona um campo TLV com valor i32.
- * @return 0 em sucesso, -1 em erro
- */
-int8_t bythos_tlv_add_i32(BythosMessage* msg, uint8_t id, int32_t value);
-
-/**
- * Adiciona um campo TLV com valor u32.
- * @return 0 em sucesso, -1 em erro
- */
-int8_t bythos_tlv_add_u32(BythosMessage* msg, uint8_t id, uint32_t value);
-
-/**
- * Adiciona um campo TLV com valor u16.
- * @return 0 em sucesso, -1 em erro
- */
-int8_t bythos_tlv_add_u16(BythosMessage* msg, uint8_t id, uint16_t value);
-
-/**
- * Adiciona um campo TLV com valor u8.
- * @return 0 em sucesso, -1 em erro
- */
-int8_t bythos_tlv_add_u8(BythosMessage* msg, uint8_t id, uint8_t value);
-
-// ============================================================================
-// FFI — INICIALIZAÇÃO DE MENSAGEM
-// ============================================================================
-
-/**
- * Inicializa uma mensagem Bythos com node_id e campos padrão.
- *
- * @param msg     Mensagem a inicializar
- * @param node_id ID do grupo CAN deste nó (0-15)
- * @param msg_id  ID da mensagem
- */
-void bythos_init(BythosMessage* msg, uint8_t node_id, uint8_t msg_id);
-
-/**
- * Define o número de sequência de uma mensagem.
- */
+/** Define a sequência (diagnóstico). */
 void bythos_set_seq(BythosMessage* msg, uint16_t seq);
 
-/**
- * Limpa uma mensagem Bythos (reseta todos os campos).
- */
+/** Define os saltos restantes. */
+void bythos_set_hops(BythosMessage* msg, uint8_t hops);
+
+/** Repõe o rascunho (preâmbulo correto, resto a zero). */
 void bythos_clear(BythosMessage* msg);
 
 // ============================================================================
-// FFI — CONVERSÃO DE BYTES
+// CONVERSÕES (tudo little-endian, ordem do fio)
 // ============================================================================
 
-/**
- * Converte float para bytes (little-endian).
- */
 void bythos_f32_to_bytes(float value, uint8_t* bytes);
-
-/**
- * Converte bytes (little-endian) para float.
- */
 float bythos_bytes_to_f32(const uint8_t* bytes);
-
-/**
- * Converte i32 para bytes (little-endian).
- */
+/** f32 → meia precisão (bits, saturando). Novo V4. */
+uint16_t bythos_f32_to_f16(float value);
+/** Meia precisão → f32. Novo V4. */
+float bythos_f16_to_f32(uint16_t bits);
 void bythos_i32_to_bytes(int32_t value, uint8_t* bytes);
-
-/**
- * Converte bytes (little-endian) para i32.
- */
 int32_t bythos_bytes_to_i32(const uint8_t* bytes);
-
-/**
- * Converte u32 para bytes (little-endian).
- */
 void bythos_u32_to_bytes(uint32_t value, uint8_t* bytes);
-
-/**
- * Converte bytes (little-endian) para u32.
- */
 uint32_t bythos_bytes_to_u32(const uint8_t* bytes);
-
-/**
- * Converte u16 para bytes (little-endian).
- */
 void bythos_u16_to_bytes(uint16_t value, uint8_t* bytes);
-
-/**
- * Converte bytes (little-endian) para u16.
- */
 uint16_t bythos_bytes_to_u16(const uint8_t* bytes);
 
 // ============================================================================
-// FFI — VALIDAÇÃO
+// DIVERSOS
 // ============================================================================
 
-/**
- * Retorna true (1) se o ID da mensagem é válido.
- */
+/** 1 se o tipo de mensagem é conhecido. */
 uint8_t bythos_msg_id_valid(uint8_t id);
 
-/**
- * Retorna a prioridade de uma mensagem.
- */
+/** Prioridade efetiva (tipo inválido = Low, unificado com o núcleo). */
 uint8_t bythos_msg_priority(uint8_t msg_id, uint8_t failsafe_active);
 
-// ============================================================================
-// FFI — UTILITÁRIOS
-// ============================================================================
-
-/**
- * Retorna a versão do protocolo como string estática.
- * @return Ponteiro para string "3.0.0" (não libertar)
- */
+/** Versão ("4.0.0", estática, não libertar). */
 const char* bythos_version(void);
 
-/**
- * Retorna o tamanho do overhead Bythos (header + signature + crc16).
- */
+/** Sobrecarga (21). */
 size_t bythos_overhead(void);
 
-/**
- * Retorna o tamanho máximo de uma mensagem Bythos.
- */
+/** Trama máxima (1205). */
 size_t bythos_max_message_size(void);
+
+// ============================================================================
+// TÚNEL COBS (rádios)
+// ============================================================================
+
+/** Codifica COBS (bytes escritos, -1 em erro). */
+bythos_ssize_t bythos_cobs_encode(const uint8_t* data, size_t len,
+                                 uint8_t* output, size_t out_size);
+
+/** Descodifica COBS (bytes escritos, -1 em erro). */
+bythos_ssize_t bythos_cobs_decode(const uint8_t* data, size_t len,
+                                 uint8_t* output, size_t out_size);
 
 #ifdef __cplusplus
 }

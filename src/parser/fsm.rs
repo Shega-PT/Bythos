@@ -1,148 +1,199 @@
-//! # Parser FSM — Máquina de Estados Finita para Parsing de Mensagens Bythos v3.0.0
+//! # Analisador Bythos — Máquina de Estados Byte-a-Byte (v4.0.0)
+//!
+//! Reconstrói tramas V4 a partir de um fluxo série, sem alocar e sem chaves:
+//! verifica **estrutura + CRC**; `TAG` e anti-replay ficam para o destino final
+//! (`codec::validate_message` sobre `completed_frame`). Separar assim permite à
+//! ponte encaminhar milhares de tramas alheias por segundo sem acordar o
+//! elemento seguro.
+//!
+//! Endurecido face à V3: cada byte armazenado é medido contra o tampão (nunca
+//! escreve fora, mesmo com `LEN` mentiroso), o timeout é imposto de verdade à
+//! entrada de cada byte (na V3 existia mas nunca disparava), e o limite de
+//! saltos é exposto para o encaminhador decidir antes de repetir.
 
-use crate::protocol::types::*;
+use crate::protocol::codec::parse_fields;
 use crate::protocol::crc16::calc_crc16;
-use crate::protocol::codec::parse_tlv;
+use crate::protocol::types::*;
 
-/// Estados da FSM do parser.
+// ============================================================================
+// ESTADOS E ERROS
+// ============================================================================
+
+/// Estados da máquina (10 na V4: o selo partiu-se em `SEC_HDR` + `TAG`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParserState {
-    /// Aguardando byte de início (START_BYTE = 0xAA).
+    /// À espera da âncora `START_BYTE`.
     WaitStart = 0,
-    /// Aguardando cabeçalho Bythos (version, nodeId, msgId, seqLo, seqHi).
-    /// 5 bytes após START_BYTE.
+    /// A juntar os 11 bytes do cabeçalho.
     WaitHeader = 1,
-    /// Aguardando número de campos TLV.
-    WaitTlvCount = 2,
-    /// Aguardando ID de um campo TLV.
-    WaitTlvId = 3,
-    /// Aguardando tamanho de um campo TLV.
-    WaitTlvLen = 4,
-    /// Aguardando dados de um campo TLV.
-    WaitTlvData = 5,
-    /// Aguardando byte de assinatura.
-    WaitSignature = 6,
-    /// Aguardando byte baixo do CRC16.
+    /// À espera do identificador de um campo.
+    WaitFieldId = 2,
+    /// À espera do comprimento de um campo.
+    WaitFieldLen = 3,
+    /// A juntar os dados de um campo.
+    WaitFieldData = 4,
+    /// A juntar os 4 bytes do cabeçalho de segurança.
+    WaitSecHdr = 5,
+    /// A juntar os 4 bytes da etiqueta.
+    WaitTag = 6,
+    /// Byte baixo do CRC16.
     WaitCrc16Lo = 7,
-    /// Aguardando byte alto do CRC16.
+    /// Byte alto do CRC16 — trama completa.
     WaitCrc16Hi = 8,
 }
 
-/// Códigos de erro do parser.
+/// Códigos de erro (todos os modos de falha do fio, sem colapsar).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParserError {
-    /// Operação bem-sucedida ou mensagem processada.
+    /// Byte aceite / trama completa sem erros.
     Ok = 0,
-    /// Byte de início inválido.
+    /// Byte fora de trama (sem `START_BYTE` à vista).
     ErrStart = 1,
-    /// Versão do protocolo incompatível.
+    /// Versão diferente de `0x04`.
     ErrVersion = 2,
-    /// ID da mensagem inválido.
+    /// Tipo de mensagem desconhecido.
     ErrMsgId = 3,
-    /// Número de campos TLV inválido.
-    ErrTlvCount = 4,
-    /// ID de campo TLV inválido.
-    ErrTlvId = 5,
-    /// Tamanho de campo TLV inválido.
-    ErrTlvLen = 6,
-    /// Checksum CRC16 inválido.
+    /// Nº de campos acima de `MAX_FIELDS`.
+    ErrFieldCount = 4,
+    /// Identificador de campo inválido.
+    ErrFieldId = 5,
+    /// Comprimento de campo inválido (>32, ou >128 fora de carga vídeo).
+    ErrFieldLen = 6,
+    /// CRC16 não bate.
     ErrChecksum = 7,
-    /// Assinatura inválida.
-    ErrSignature = 8,
-    /// Timeout entre bytes (frame gap excedido).
-    ErrTimeout = 9,
+    /// Silêncio entre bytes além do limite.
+    ErrTimeout = 8,
+    /// Tampão cheio antes do fim da trama (ataque ou `LEN` mentiroso).
+    ErrOverflow = 9,
+    /// Saltos esgotados (a trama não deve ser repetida).
+    ErrHops = 10,
 }
 
-/// Parser FSM para mensagens Bythos v3.0.0.
+// ============================================================================
+// ANALISADOR
+// ============================================================================
+
+/// Analisador de tramas V4: sem heap, sem chaves, sem relógio próprio.
 ///
-/// Reconstrói mensagens Bythos completas a partir de um fluxo de bytes
-/// recebidos serialmente. Utiliza uma FSM de 9 estados com proteções
-/// contra timeout, overflow e erros de integridade.
+/// Todo o estado cabe em ~1,3 KiB (`raw_buffer` de 1205 B + mensagem): corre na
+/// pilha de um MCU sem pensar duas vezes. O `TAG` **não** é verificado aqui —
+/// ver doc do módulo para o porquê.
 pub struct Parser {
-    /// Estado atual da FSM.
+    /// Estado atual.
     state: ParserState,
-    /// Buffer para acumular bytes da mensagem em construção.
+    /// Bytes acumulados da trama em construção.
     raw_buffer: [u8; MAX_MESSAGE_SIZE],
-    /// Número de bytes acumulados no buffer.
+    /// Posição de escrita (invariante: sempre `< MAX_MESSAGE_SIZE`).
     raw_offset: usize,
-    /// Número de bytes de dados que faltam para o campo TLV atual.
-    tlv_data_remaining: usize,
-    /// Mensagem Bythos reconstruída (resultado do parsing).
-    msg: TLVMessage,
-    /// Máximo intervalo entre bytes em microssegundos (timeout).
+    /// Dados que faltam no campo atual.
+    field_data_remaining: usize,
+    /// Se já passou uma carga vídeo grande nesta trama (só uma, ver spec).
+    video_big_seen: bool,
+    /// Mensagem reconstruída (válida quando `has_message`).
+    msg: BythosMessage,
+    /// Cópia exata dos bytes da trama completa no fio.
+    ///
+    /// Necessária porque `validate_message` (TAG + replay) trabalha sobre bytes,
+    /// não sobre a estrutura: sem esta cópia, o destino teria de re-serializar
+    /// (e a re-serialização com outro `CTR` daria outro `TAG` — impossível).
+    frame_copy: [u8; MAX_MESSAGE_SIZE],
+    /// Comprimento da trama completa (para `completed_frame`).
+    completed_len: usize,
+    /// Silêncio máximo entre bytes, em µs (timeout de trama partida).
     max_frame_gap_us: u32,
-    /// Timestamp do último byte recebido em microssegundos.
+    /// Carimbo do último byte aceite, em µs.
     last_byte_time_us: u64,
-    /// Indica se uma mensagem completa está disponível.
+    /// Trama completa disponível.
     has_message: bool,
-    /// Contador de mensagens processadas com sucesso.
+    /// Tramas boas desde o arranque (diagnóstico).
     success_count: u32,
-    /// Contador de erros de parsing.
+    /// Erros desde o arranque (diagnóstico).
     error_count: u32,
-    /// Último erro registado pelo parser.
+    /// Último erro (persiste para diagnóstico após reinício interno).
     last_error: ParserError,
-    /// Indica se a saída de debug está habilitada.
+    /// Saída de depuração (só com `std`).
     debug: bool,
-    /// Chave de assinatura (XOR key) para validação.
-    signature_key: u8,
 }
 
 impl Parser {
-    /// Cria um novo parser FSM.
-    ///
-    /// O parser é inicializado no estado `WaitStart` pronto para
-    /// receber bytes de uma nova mensagem.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` — Chave de assinatura (XOR key) para validação de mensagens.
-    pub fn new(key: u8) -> Self {
+    /// Analisador virgem, no estado `WaitStart`.
+    pub fn new() -> Self {
         Self {
             state: ParserState::WaitStart,
             raw_buffer: [0u8; MAX_MESSAGE_SIZE],
             raw_offset: 0,
-            tlv_data_remaining: 0,
-            msg: TLVMessage::new(),
-            max_frame_gap_us: 5_000_000, // 5 segundos por defeito
+            field_data_remaining: 0,
+            video_big_seen: false,
+            msg: BythosMessage::new(),
+            frame_copy: [0u8; MAX_MESSAGE_SIZE],
+            completed_len: 0,
+            // 1 s por defeito: folgado para 250 kbps (trama máxima ≈ 40 ms) e
+            // apertado o suficiente para não segurar lixo uma eternidade.
+            max_frame_gap_us: 1_000_000,
             last_byte_time_us: 0,
             has_message: false,
             success_count: 0,
             error_count: 0,
             last_error: ParserError::Ok,
             debug: false,
-            signature_key: key,
         }
     }
 
-    /// Alimenta um byte ao parser.
+    /// Guarda um byte no tampão com medição de limite.
     ///
-    /// Este é o método principal do parser. Cada byte recebido do
-    /// fluxo serial deve ser passado através deste método. A FSM
-    /// transita entre estados conforme os bytes são processados.
-    ///
-    /// # Arguments
-    ///
-    /// * `byte` — Byte a processar.
-    ///
-    /// # Returns
-    ///
-    /// `ParserError::Ok` se o byte foi processado com sucesso,
-    /// ou um código de erro específico.
-    pub fn feed(&mut self, byte: u8) -> ParserError {
-        // Atualizar timestamp do último byte
-        self.last_byte_time_us = self.get_timestamp_us();
+    /// O ponto único de escrita: quem o contorna está a introduzir OOB. Devolve
+    /// `false` se o tampão estiver cheio — o chamador reinicia com `ErrOverflow`.
+    fn store(&mut self, byte: u8) -> bool {
+        if self.raw_offset >= MAX_MESSAGE_SIZE {
+            return false;
+        }
+        self.raw_buffer[self.raw_offset] = byte;
+        self.raw_offset += 1;
+        true
+    }
 
+    /// Falha com reinício: conta, regista, volta ao início e devolve o código.
+    ///
+    /// Centralizar aqui garante que nenhum caminho de erro se esquece de contar
+    /// ou deixa a máquina presa a meio de uma trama morta.
+    fn fail(&mut self, err: ParserError) -> ParserError {
+        self.last_error = err;
+        self.error_count += 1;
+        self.state = ParserState::WaitStart;
+        self.raw_offset = 0;
+        self.field_data_remaining = 0;
+        self.video_big_seen = false;
+        err
+    }
+
+    /// Alimenta um byte à máquina.
+    ///
+    /// Ordem de verificações: timeout primeiro (trama velha morre antes de
+    /// misturar bytes de duas emissões), depois limite de tampão, depois a
+    /// lógica do estado. `Ok` não significa "trama pronta" — significa "byte
+    /// aceite"; a trama pronta anuncia-se com `has_message()`.
+    pub fn feed(&mut self, byte: u8) -> ParserError {
+        // Timeout real: se o silêncio excedeu o limite a meio de uma trama, a
+        // trama morre aqui — na V3 esta verificação existia mas nunca corria.
+        if self.state != ParserState::WaitStart && self.is_timed_out() {
+            self.fail(ParserError::ErrTimeout);
+            // Cai para `WaitStart` e reprocessa o byte como possível âncora.
+        }
+        let now = self.get_timestamp_us();
         match self.state {
-            // ====================================================================
-            // ESTADO 0: Aguardar byte de início
-            // ====================================================================
+            // --- Âncora: só o START_BYTE abre trama; o resto é ruído. ---
             ParserState::WaitStart => {
+                self.last_byte_time_us = now;
                 if byte == START_BYTE {
                     self.raw_offset = 0;
-                    self.raw_buffer[0] = byte;
-                    self.raw_offset = 1;
+                    self.video_big_seen = false;
+                    // `store` não falha aqui (tampão vazio), mas mede-se na
+                    // mesma — invariantes absolutas não têm exceções.
+                    if !self.store(byte) {
+                        return self.fail(ParserError::ErrOverflow);
+                    }
                     self.state = ParserState::WaitHeader;
                     ParserError::Ok
                 } else {
@@ -152,261 +203,248 @@ impl Parser {
                 }
             }
 
-            // ====================================================================
-            // ESTADO 1: Aguardar cabeçalho (6 bytes: ver, node, msg, seqLo, seqHi)
-            // ====================================================================
+            // --- Cabeçalho: junta 11 bytes e valida versão/tipo/contagem. ---
             ParserState::WaitHeader => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-
-                // Cabeçalho sem TLV_COUNT: START + ver + node + msg + seqLo + seqHi = 6 bytes
-                if self.raw_offset >= (BYTHOS_HEADER_SIZE - 1) {
-                    // Validar versão
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
+                }
+                if self.raw_offset >= BYTHOS_HEADER_SIZE {
                     if self.raw_buffer[1] != BYTHOS_VERSION {
-                        self.last_error = ParserError::ErrVersion;
-                        self.error_count += 1;
-                        self.state = ParserState::WaitStart;
-                        return ParserError::ErrVersion;
+                        return self.fail(ParserError::ErrVersion);
                     }
-
-                    // Validar msg_id
-                    let msg_id = self.raw_buffer[3];
-                    if !MsgId::is_valid(msg_id) {
-                        self.last_error = ParserError::ErrMsgId;
-                        self.error_count += 1;
-                        self.state = ParserState::WaitStart;
-                        return ParserError::ErrMsgId;
+                    if !BythosMsgId::is_valid(self.raw_buffer[6]) {
+                        return self.fail(ParserError::ErrMsgId);
                     }
-
-                    self.state = ParserState::WaitTlvCount;
-                }
-
-                ParserError::Ok
-            }
-
-            // ====================================================================
-            // ESTADO 2: Aguardar número de campos TLV
-            // ====================================================================
-            ParserState::WaitTlvCount => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-
-                if (byte as usize) <= MAX_TLV_FIELDS {
-                    if byte == 0 {
-                        // Sem campos TLV — ir direto para assinatura
-                        self.state = ParserState::WaitSignature;
+                    let count = self.raw_buffer[9];
+                    if count as usize > MAX_FIELDS {
+                        return self.fail(ParserError::ErrFieldCount);
+                    }
+                    // Saltos a zero vindos do fio não viajam: a ponte que recebe
+                    // `HOPS == 0` consome localmente e nunca repete (ver `ErrHops`
+                    // no fecho da trama).
+                    self.state = if count == 0 {
+                        ParserState::WaitSecHdr
                     } else {
-                        self.state = ParserState::WaitTlvId;
-                    }
-                    ParserError::Ok
-                } else {
-                    self.last_error = ParserError::ErrTlvCount;
-                    self.error_count += 1;
-                    self.state = ParserState::WaitStart;
-                    ParserError::ErrTlvCount
+                        ParserState::WaitFieldId
+                    };
                 }
+                ParserError::Ok
             }
 
-            // ====================================================================
-            // ESTADO 3: Aguardar ID de campo TLV
-            // ====================================================================
-            ParserState::WaitTlvId => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-
-                // Validar tipo do FieldID
-                let (field_type, _) = field_id_decode(byte);
-                if FieldType::from_u8(field_type).is_some() {
-                    self.state = ParserState::WaitTlvLen;
-                    ParserError::Ok
-                } else {
-                    self.last_error = ParserError::ErrTlvId;
-                    self.error_count += 1;
-                    self.state = ParserState::WaitStart;
-                    ParserError::ErrTlvId
+            // --- Identificador do campo: tipo tem de ser conhecido. ---
+            ParserState::WaitFieldId => {
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
                 }
+                let (ftype, _) = bythos_field_id_decode(byte);
+                if BythosFieldType::from_u8(ftype).is_none() {
+                    return self.fail(ParserError::ErrFieldId);
+                }
+                self.state = ParserState::WaitFieldLen;
+                ParserError::Ok
             }
 
-            // ====================================================================
-            // ESTADO 4: Aguardar tamanho de campo TLV
-            // ====================================================================
-            ParserState::WaitTlvLen => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-
-                if (byte as usize) <= MAX_TLV_DATA {
-                    self.tlv_data_remaining = byte as usize;
-
-                    if byte == 0 {
-                        // Campo sem dados — verificar se há mais campos
-                        self.check_next_tlv_or_signature();
+            // --- Comprimento: 32 normal; 128 só em carga vídeo raw, uma vez. ---
+            ParserState::WaitFieldLen => {
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
+                }
+                let len = byte as usize;
+                if len <= MAX_FIELD_DATA {
+                    self.field_data_remaining = len;
+                    if len == 0 {
+                        self.check_next_field_or_sec();
                     } else {
-                        self.state = ParserState::WaitTlvData;
+                        self.state = ParserState::WaitFieldData;
                     }
+                    return ParserError::Ok;
+                }
+                // Caminho grande: só carga vídeo `raw` 0x00, só uma por trama.
+                let fid = self.raw_buffer[self.raw_offset - 2];
+                let (ftype, _) = bythos_field_id_decode(fid);
+                let is_video =
+                    ftype == BythosFieldType::Raw as u8 && fid == BythosFieldId::VideoPayload as u8;
+                if len <= MAX_FIELD_VIDEO_DATA && is_video && !self.video_big_seen {
+                    self.video_big_seen = true;
+                    self.field_data_remaining = len;
+                    self.state = ParserState::WaitFieldData;
                     ParserError::Ok
                 } else {
-                    self.last_error = ParserError::ErrTlvLen;
-                    self.error_count += 1;
-                    self.state = ParserState::WaitStart;
-                    ParserError::ErrTlvLen
+                    self.fail(ParserError::ErrFieldLen)
                 }
             }
 
-            // ====================================================================
-            // ESTADO 5: Aguardar dados de campo TLV
-            // ====================================================================
-            ParserState::WaitTlvData => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-                self.tlv_data_remaining -= 1;
-
-                if self.tlv_data_remaining == 0 {
-                    // Todos os bytes deste campo foram recebidos
-                    self.check_next_tlv_or_signature();
+            // --- Dados: conta em baixo até zero, depois decide o próximo. ---
+            ParserState::WaitFieldData => {
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
                 }
-
+                self.field_data_remaining -= 1;
+                if self.field_data_remaining == 0 {
+                    self.check_next_field_or_sec();
+                }
                 ParserError::Ok
             }
 
-            // ====================================================================
-            // ESTADO 6: Aguardar byte de assinatura
-            // ====================================================================
-            ParserState::WaitSignature => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-                self.state = ParserState::WaitCrc16Lo;
+            // --- Segurança e etiqueta: 8 bytes opacos (o destino valida). ---
+            ParserState::WaitSecHdr | ParserState::WaitTag => {
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
+                }
+                // 4 bytes de SEC_HDR após os campos, depois 4 de TAG.
+                let fields_end = self.fields_end_offset();
+                match self.state {
+                    ParserState::WaitSecHdr if self.raw_offset >= fields_end + SEC_HDR_SIZE => {
+                        self.state = ParserState::WaitTag;
+                    }
+                    ParserState::WaitTag
+                        if self.raw_offset >= fields_end + SEC_HDR_SIZE + TAG_SIZE =>
+                    {
+                        self.state = ParserState::WaitCrc16Lo;
+                    }
+                    _ => {}
+                }
                 ParserError::Ok
             }
 
-            // ====================================================================
-            // ESTADO 7: Aguardar byte baixo do CRC16
-            // ====================================================================
+            // --- CRC baixo/alto: no alto, a trama fecha e valida-se. ---
             ParserState::WaitCrc16Lo => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
+                }
                 self.state = ParserState::WaitCrc16Hi;
                 ParserError::Ok
             }
-
-            // ====================================================================
-            // ESTADO 8: Aguardar byte alto do CRC16 — Mensagem completa!
-            // ====================================================================
             ParserState::WaitCrc16Hi => {
-                self.raw_buffer[self.raw_offset] = byte;
-                self.raw_offset += 1;
-
-                // Validar CRC16
-                let crc_offset = self.raw_offset - CRC16_SIZE;
-                let crc_lo = self.raw_buffer[crc_offset];
-                let crc_hi = self.raw_buffer[crc_offset + 1];
-                let expected_crc = (crc_hi as u16) << 8 | (crc_lo as u16);
-                let computed_crc = calc_crc16(&self.raw_buffer[..crc_offset]);
-
-                if computed_crc != expected_crc {
-                    self.last_error = ParserError::ErrChecksum;
-                    self.error_count += 1;
-                    self.state = ParserState::WaitStart;
-                    return ParserError::ErrChecksum;
+                self.last_byte_time_us = now;
+                if !self.store(byte) {
+                    return self.fail(ParserError::ErrOverflow);
                 }
-
-                // Validar assinatura
-                let sig_offset = crc_offset - SIGNATURE_SIZE;
-                let signature = self.raw_buffer[sig_offset];
-                let msg_id = self.raw_buffer[3];
-                let seq_lo = self.raw_buffer[4];
-                let seq_hi = self.raw_buffer[5];
-                let expected_sig = compute_signature(
-                    self.signature_key,
-                    msg_id,
-                    seq_lo,
-                    seq_hi,
-                );
-
-                if signature != expected_sig {
-                    self.last_error = ParserError::ErrSignature;
-                    self.error_count += 1;
-                    self.state = ParserState::WaitStart;
-                    return ParserError::ErrSignature;
+                // CRC sobre tudo menos ele próprio.
+                let crc_at = self.raw_offset - CRC16_SIZE;
+                let received =
+                    u16::from_le_bytes([self.raw_buffer[crc_at], self.raw_buffer[crc_at + 1]]);
+                if calc_crc16(&self.raw_buffer[..crc_at]) != received {
+                    return self.fail(ParserError::ErrChecksum);
                 }
-
-                // Parsing bem-sucedido — extrair campos TLV
-                let tlv_data_start = BYTHOS_HEADER_SIZE;
-                let tlv_data_end = sig_offset;
-
-                let mut tlv_output = [TLVField::new(); MAX_TLV_FIELDS];
-                match parse_tlv(
-                    &self.raw_buffer[tlv_data_start..tlv_data_end],
-                    &mut tlv_output,
-                ) {
-                    Ok(parsed_count) => {
+                // Extrai os campos para a mensagem (sem verificar TAG: sem chaves).
+                let fields_start = BYTHOS_HEADER_SIZE;
+                let fields_end = crc_at - SEC_HDR_SIZE - TAG_SIZE;
+                let mut parsed = [BythosField::new(); MAX_FIELDS];
+                match parse_fields(&self.raw_buffer[fields_start..fields_end], &mut parsed) {
+                    Ok(count) => {
+                        // Coerência: o analisado tem de casar com o anunciado.
+                        if count != self.raw_buffer[9] as usize {
+                            return self.fail(ParserError::ErrChecksum);
+                        }
                         self.msg.start_byte = self.raw_buffer[0];
                         self.msg.version = self.raw_buffer[1];
-                        self.msg.node_id = self.raw_buffer[2];
-                        self.msg.msg_id = self.raw_buffer[3];
-                        self.msg.seq_num = (seq_hi as u16) << 8 | (seq_lo as u16);
-                        self.msg.tlv_count = parsed_count as u8;
-                        self.msg.tlvs[..parsed_count].copy_from_slice(&tlv_output[..parsed_count]);
-                        self.msg.signature = signature;
-                        self.msg.checksum = expected_crc;
+                        self.msg.src = u16::from_le_bytes([self.raw_buffer[2], self.raw_buffer[3]]);
+                        self.msg.dst = u16::from_le_bytes([self.raw_buffer[4], self.raw_buffer[5]]);
+                        self.msg.msg_id = self.raw_buffer[6];
+                        self.msg.seq_num =
+                            u16::from_le_bytes([self.raw_buffer[7], self.raw_buffer[8]]);
+                        self.msg.field_count = count as u8;
+                        self.msg.hops = self.raw_buffer[10];
+                        self.msg.fields[..count].copy_from_slice(&parsed[..count]);
+                        self.msg.key_id = self.raw_buffer[fields_end];
+                        let ctr = (self.raw_buffer[fields_end + 1] as u32)
+                            | ((self.raw_buffer[fields_end + 2] as u32) << 8)
+                            | ((self.raw_buffer[fields_end + 3] as u32) << 16);
+                        self.msg.ctr = ctr;
+                        self.msg.tag.copy_from_slice(
+                            &self.raw_buffer
+                                [fields_end + SEC_HDR_SIZE..fields_end + SEC_HDR_SIZE + TAG_SIZE],
+                        );
+                        self.msg.checksum = received;
+                        self.frame_copy[..self.raw_offset]
+                            .copy_from_slice(&self.raw_buffer[..self.raw_offset]);
+                        self.completed_len = self.raw_offset;
                         self.has_message = true;
                         self.success_count += 1;
                         self.last_error = ParserError::Ok;
                         self.state = ParserState::WaitStart;
-
+                        self.raw_offset = 0;
+                        self.video_big_seen = false;
+                        // Saltos esgotados: a trama é válida localmente, mas o
+                        // encaminhador não a pode repetir — sinaliza-se com o
+                        // último erro sem invalidar a mensagem.
+                        if self.msg.hops == 0 {
+                            self.last_error = ParserError::ErrHops;
+                        }
                         ParserError::Ok
                     }
-                    Err(_) => {
-                        self.last_error = ParserError::ErrChecksum;
-                        self.error_count += 1;
-                        self.state = ParserState::WaitStart;
-                        ParserError::ErrChecksum
-                    }
+                    Err(_) => self.fail(ParserError::ErrChecksum),
                 }
             }
         }
     }
 
-    /// Verifica se o próximo byte deve ser ID de um novo campo TLV
-    /// ou se devemos avançar para a assinatura.
-    fn check_next_tlv_or_signature(&mut self) {
-        // Contar campos TLV processados calculando o offset
-        let tlv_count = self.raw_buffer[6] as usize;
-        let mut temp_offset = BYTHOS_HEADER_SIZE;
-        let mut campos_processados = 0;
-
-        while campos_processados < tlv_count && temp_offset + TLV_HEADER_SIZE <= self.raw_offset {
-            let field_len = self.raw_buffer[temp_offset + 1] as usize;
-            temp_offset += TLV_HEADER_SIZE + field_len;
-            campos_processados += 1;
-        }
-
-        if campos_processados >= tlv_count {
-            self.state = ParserState::WaitSignature;
+    /// Fim dos campos já acumulados (percorre o que está no tampão).
+    ///
+    /// Re-percorrer a cada campo é O(n²) no pior caso (32 campos): irrelevante
+    /// — n ≤ 32 e cada passo são 2 leituras. Clareza primeiro; o caminho quente
+    /// do anel é encaminhar pelo `DST` do cabeçalho, não re-analisar campos.
+    fn fields_end_offset(&self) -> usize {
+        let count = if self.raw_offset > 9 {
+            self.raw_buffer[9] as usize
         } else {
-            self.state = ParserState::WaitTlvId;
+            0
+        };
+        let mut at = BYTHOS_HEADER_SIZE;
+        let mut done = 0;
+        while done < count && at + FIELD_HEADER_SIZE <= self.raw_offset {
+            let len = self.raw_buffer[at + 1] as usize;
+            at += FIELD_HEADER_SIZE + len;
+            done += 1;
         }
+        at
     }
 
-    /// Retorna true se uma mensagem completa está disponível.
+    /// Decide entre mais um campo ou o reboque de segurança.
+    fn check_next_field_or_sec(&mut self) {
+        let count = self.raw_buffer[9] as usize;
+        let mut at = BYTHOS_HEADER_SIZE;
+        let mut done = 0;
+        while done < count && at + FIELD_HEADER_SIZE <= self.raw_offset {
+            let len = self.raw_buffer[at + 1] as usize;
+            at += FIELD_HEADER_SIZE + len;
+            done += 1;
+        }
+        self.state = if done >= count {
+            ParserState::WaitSecHdr
+        } else {
+            ParserState::WaitFieldId
+        };
+    }
+
+    /// Trama completa disponível para consumo.
     pub fn has_message(&self) -> bool {
         self.has_message
     }
 
-    /// Retorna uma referência à mensagem reconstruída.
-    pub fn get_message(&self) -> &TLVMessage {
+    /// Mensagem reconstruída (só válida com `has_message()`).
+    pub fn get_message(&self) -> &BythosMessage {
         &self.msg
     }
 
-    /// Copia a mensagem reconstruída para um buffer de saída.
-    ///
-    /// # Arguments
-    ///
-    /// * `output` — Buffer de saída para a mensagem.
-    ///
-    /// # Returns
-    ///
-    /// `true` se a mensagem foi copiada com sucesso, `false` caso contrário.
-    pub fn copy_message(&self, output: &mut TLVMessage) -> bool {
+    /// Bytes exatos da trama completa no fio (para `validate_message` no destino
+    /// final: `TAG` + replay com chave e tabela de pares).
+    pub fn completed_frame(&self) -> Option<&[u8]> {
+        if !self.has_message {
+            return None;
+        }
+        Some(&self.frame_copy[..self.completed_len])
+    }
+
+    /// Copia a mensagem para o destino (falso sem trama completa).
+    pub fn copy_message(&self, output: &mut BythosMessage) -> bool {
         if !self.has_message {
             return false;
         }
@@ -414,80 +452,67 @@ impl Parser {
         true
     }
 
-    /// Reconhece a mensagem processada, permitindo que o parser processe a próxima.
+    /// Confirma o consumo: liberta a máquina para a próxima trama.
     ///
-    /// Deve ser chamado após processar a mensagem obtida via `get_message()`.
+    /// Esquecer o `acknowledge` deixa `has_message` preso em verdadeiro — erro
+    /// clássico de integração, documentado aqui para não se repetir.
     pub fn acknowledge(&mut self) {
         self.has_message = false;
+        self.completed_len = 0;
         self.msg.clear();
     }
 
-    /// Reseta o parser para o estado inicial.
+    /// Reinício total (estado, tampão, mensagem pendente).
     pub fn reset(&mut self) {
         self.state = ParserState::WaitStart;
         self.raw_offset = 0;
-        self.tlv_data_remaining = 0;
+        self.field_data_remaining = 0;
+        self.video_big_seen = false;
         self.has_message = false;
+        self.completed_len = 0;
         self.msg.clear();
     }
 
-    /// Define o intervalo máximo entre bytes (timeout) em microssegundos.
-    ///
-    /// Se dois bytes consecutivos demorarem mais do que este intervalo,
-    /// o parser será resetado automaticamente.
+    /// Silêncio máximo entre bytes, em µs.
     pub fn set_max_frame_gap(&mut self, micros: u32) {
         self.max_frame_gap_us = micros;
     }
 
-    /// Verifica se o parser excedeu o timeout entre bytes.
+    /// `true` se o silêncio atual excede o limite (fora de `WaitStart`).
     pub fn is_timed_out(&self) -> bool {
         if self.state == ParserState::WaitStart {
             return false;
         }
         let now = self.get_timestamp_us();
-        let elapsed = now.wrapping_sub(self.last_byte_time_us);
-        elapsed > self.max_frame_gap_us as u64
+        now.wrapping_sub(self.last_byte_time_us) > self.max_frame_gap_us as u64
     }
 
-    /// Retorna o último erro registado pelo parser.
+    /// Último erro (persiste após reinício interno — diagnóstico, não estado).
     pub fn get_last_error(&self) -> ParserError {
         self.last_error
     }
 
-    /// Retorna o estado atual da FSM.
+    /// Estado atual (diagnóstico e testes).
     pub fn get_current_state(&self) -> ParserState {
         self.state
     }
 
-    /// Retorna o número de mensagens processadas com sucesso.
+    /// Contador de tramas boas.
     pub fn get_success_count(&self) -> u32 {
         self.success_count
     }
 
-    /// Retorna o número de erros de parsing.
+    /// Contador de erros.
     pub fn get_error_count(&self) -> u32 {
         self.error_count
     }
 
-    /// Ativa ou desativa a saída de debug.
+    /// Interruptor de depuração (só produz saída com `std`).
     pub fn set_debug(&mut self, enable: bool) {
         self.debug = enable;
     }
 
-    /// Retorna a chave de assinatura configurada.
-    pub fn get_key(&self) -> u8 {
-        self.signature_key
-    }
-
-    /// Define a chave de assinatura.
-    pub fn set_key(&mut self, key: u8) {
-        self.signature_key = key;
-    }
-
-    /// Obtém o timestamp atual em microssegundos.
-    ///
-    /// Em ambientes std, retorna o tempo real desde o epoch.
-    /// Em ambientes no_std, retorna 0 (timeout desativado).
+    /// Relógio em µs; sem `std` devolve 0 (timeout desligado, documentado).
     fn get_timestamp_us(&self) -> u64 {
         #[cfg(feature = "std")]
         {
@@ -506,38 +531,39 @@ impl Parser {
 
 impl Default for Parser {
     fn default() -> Self {
-        Self::new(0)
+        Self::new()
     }
 }
 
-/// Converte um estado do parser para string legível.
+/// Nome de estado para diagnóstico.
 pub fn parser_state_to_string(state: ParserState) -> &'static str {
     match state {
         ParserState::WaitStart => "WAIT_START",
         ParserState::WaitHeader => "WAIT_HEADER",
-        ParserState::WaitTlvCount => "WAIT_TLV_COUNT",
-        ParserState::WaitTlvId => "WAIT_TLV_ID",
-        ParserState::WaitTlvLen => "WAIT_TLV_LEN",
-        ParserState::WaitTlvData => "WAIT_TLV_DATA",
-        ParserState::WaitSignature => "WAIT_SIGNATURE",
+        ParserState::WaitFieldId => "WAIT_FIELD_ID",
+        ParserState::WaitFieldLen => "WAIT_FIELD_LEN",
+        ParserState::WaitFieldData => "WAIT_FIELD_DATA",
+        ParserState::WaitSecHdr => "WAIT_SEC_HDR",
+        ParserState::WaitTag => "WAIT_TAG",
         ParserState::WaitCrc16Lo => "WAIT_CRC16_LO",
         ParserState::WaitCrc16Hi => "WAIT_CRC16_HI",
     }
 }
 
-/// Converte um código de erro do parser para string legível.
+/// Nome de erro para diagnóstico.
 pub fn parser_error_to_string(error: ParserError) -> &'static str {
     match error {
         ParserError::Ok => "OK",
         ParserError::ErrStart => "ERR_START",
         ParserError::ErrVersion => "ERR_VERSION",
         ParserError::ErrMsgId => "ERR_MSGID",
-        ParserError::ErrTlvCount => "ERR_TLV_COUNT",
-        ParserError::ErrTlvId => "ERR_TLV_ID",
-        ParserError::ErrTlvLen => "ERR_TLV_LEN",
+        ParserError::ErrFieldCount => "ERR_FIELD_COUNT",
+        ParserError::ErrFieldId => "ERR_FIELD_ID",
+        ParserError::ErrFieldLen => "ERR_FIELD_LEN",
         ParserError::ErrChecksum => "ERR_CHECKSUM",
-        ParserError::ErrSignature => "ERR_SIGNATURE",
         ParserError::ErrTimeout => "ERR_TIMEOUT",
+        ParserError::ErrOverflow => "ERR_OVERFLOW",
+        ParserError::ErrHops => "ERR_HOPS",
     }
 }
 
@@ -548,263 +574,189 @@ pub fn parser_error_to_string(error: ParserError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::builder::TLVBuilder;
-    use std::vec::Vec;
+    use crate::protocol::builder::BythosBuilder;
+    use crate::protocol::secure::SealConfig;
 
-    /// Helper: constrói uma mensagem serializada para testes.
-    fn build_test_message(msg_id: u8, key: u8, tlv_data: &[(u8, &[u8])], seq: u16) -> Vec<u8> {
-        let mut builder = TLVBuilder::new(0x06, key);
-        builder.set_seq(seq);
-        for (id, data) in tlv_data {
-            builder.add_raw(*id, data).unwrap();
+    /// Trama selada de teste (origem 6, chave fixa), sem `std` nem heap.
+    fn sealed(msg_id: u8, fields: &[(u8, &[u8])], seq: u16) -> ([u8; MAX_MESSAGE_SIZE], usize) {
+        let mut b = BythosBuilder::new(6, SealConfig::software(0, [0x42u8; 32], 6));
+        b.set_seq(seq);
+        for (id, data) in fields {
+            b.add_raw(*id, data).unwrap();
         }
-        let mut buffer = [0u8; MAX_MESSAGE_SIZE];
-        let size = builder.build(msg_id, &mut buffer).unwrap();
-        buffer[..size].to_vec()
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let n = b.build(msg_id, BROADCAST_ADDR, &mut buf).unwrap();
+        (buf, n)
     }
 
-    #[test]
-    fn test_parser_new() {
-        let parser = Parser::new(0x42);
-        assert_eq!(parser.get_current_state(), ParserState::WaitStart);
-        assert!(!parser.has_message());
-        assert_eq!(parser.get_success_count(), 0);
-        assert_eq!(parser.get_error_count(), 0);
-        assert_eq!(parser.get_key(), 0x42);
-    }
-
-    #[test]
-    fn test_parser_feed_start_byte() {
-        let mut parser = Parser::new(0x42);
-        let result = parser.feed(START_BYTE);
-        assert_eq!(result, ParserError::Ok);
-        assert_eq!(parser.get_current_state(), ParserState::WaitHeader);
-    }
-
-    #[test]
-    fn test_parser_feed_invalid_start() {
-        let mut parser = Parser::new(0x42);
-        let result = parser.feed(0x00);
-        assert_eq!(result, ParserError::ErrStart);
-        assert_eq!(parser.get_current_state(), ParserState::WaitStart);
-    }
-
-    #[test]
-    fn test_parser_full_message() {
-        let serialized = build_test_message(0x11, 0x42, &[(0xC0, &[0x02])], 1);
-        let mut parser = Parser::new(0x42);
-
-        for &byte in &serialized {
-            let result = parser.feed(byte);
-            assert_eq!(result, ParserError::Ok);
+    /// Alimenta tudo e exige `Ok` em cada byte.
+    fn feed_all(p: &mut Parser, bytes: &[u8]) {
+        for &byte in bytes {
+            assert_eq!(p.feed(byte), ParserError::Ok);
         }
+    }
 
-        assert!(parser.has_message());
-        let msg = parser.get_message();
-        assert_eq!(msg.start_byte, START_BYTE);
-        assert_eq!(msg.version, BYTHOS_VERSION);
-        assert_eq!(msg.node_id, 0x06);
+    #[test]
+    fn test_novo_e_ancora() {
+        let mut p = Parser::new();
+        assert_eq!(p.get_current_state(), ParserState::WaitStart);
+        assert!(!p.has_message());
+        assert_eq!(p.feed(0x00), ParserError::ErrStart);
+        assert_eq!(p.feed(START_BYTE), ParserError::Ok);
+        assert_eq!(p.get_current_state(), ParserState::WaitHeader);
+    }
+
+    #[test]
+    fn test_trama_completa() {
+        let (wire, n) = sealed(0x11, &[(0xC0, &[0x02])], 1);
+        let mut p = Parser::new();
+        feed_all(&mut p, &wire[..n]);
+        assert!(p.has_message());
+        let msg = p.get_message();
+        assert_eq!(msg.src, 6);
+        assert_eq!(msg.dst, BROADCAST_ADDR);
         assert_eq!(msg.msg_id, 0x11);
         assert_eq!(msg.seq_num, 1);
-        assert_eq!(msg.tlv_count, 1);
-        assert_eq!(msg.tlvs[0].id, 0xC0);
-        assert_eq!(msg.tlvs[0].len, 1);
-        assert_eq!(msg.tlvs[0].data[0], 0x02);
-
-        parser.acknowledge();
-        assert!(!parser.has_message());
+        assert_eq!(msg.field_count, 1);
+        assert_eq!(msg.fields[0].id, 0xC0);
+        assert_eq!(msg.hops, HOP_DEFAULT);
+        // A trama completa está disponível para validação ponta-a-ponta.
+        assert_eq!(p.completed_frame(), Some(&wire[..n]));
+        p.acknowledge();
+        assert!(!p.has_message());
     }
 
     #[test]
-    fn test_parser_multiple_tlvs() {
-        let serialized = build_test_message(0x16, 0x42, &[
-            (0xA0, &42u16.to_le_bytes()),
-            (0xC3, &[0x03]),
-            (0xC4, &[0x10]),
-        ], 5);
-        let mut parser = Parser::new(0x42);
+    fn test_multiplos_campos_e_vazia() {
+        let (wire, n) = sealed(0x16, &[(0xA0, &42u16.to_le_bytes()), (0xC3, &[0x03])], 5);
+        let mut p = Parser::new();
+        feed_all(&mut p, &wire[..n]);
+        assert!(p.has_message());
+        assert_eq!(p.get_message().field_count, 2);
+        p.acknowledge();
 
-        for &byte in &serialized {
-            parser.feed(byte);
+        let (empty, m) = sealed(0x10, &[], 0);
+        feed_all(&mut p, &empty[..m]);
+        assert!(p.has_message());
+        assert_eq!(p.get_message().field_count, 0);
+        p.acknowledge();
+        assert_eq!(p.get_success_count(), 2);
+    }
+
+    #[test]
+    fn test_crc_errado() {
+        let (mut wire, n) = sealed(0x11, &[(0xC0, &[0x02])], 1);
+        wire[n - 1] = wire[n - 1].wrapping_add(1);
+        let mut p = Parser::new();
+        let mut saw_err = false;
+        for &byte in &wire[..n] {
+            if p.feed(byte) == ParserError::ErrChecksum {
+                saw_err = true;
+            }
         }
-
-        assert!(parser.has_message());
-        let msg = parser.get_message();
-        assert_eq!(msg.tlv_count, 3);
-        assert_eq!(msg.tlvs[0].id, 0xA0);
-        assert_eq!(msg.tlvs[1].id, 0xC3);
-        assert_eq!(msg.tlvs[2].id, 0xC4);
-        assert_eq!(msg.seq_num, 5);
-
-        parser.acknowledge();
+        assert!(saw_err);
+        assert!(!p.has_message());
+        assert!(p.get_error_count() > 0);
     }
 
     #[test]
-    fn test_parser_invalid_crc() {
-        let mut serialized = build_test_message(0x11, 0x42, &[(0xC0, &[0x02])], 1);
-        // Corromper CRC
-        let last = serialized.len() - 1;
-        serialized[last] = serialized[last].wrapping_add(1);
-
-        let mut parser = Parser::new(0x42);
-        for &byte in &serialized {
-            parser.feed(byte);
+    fn test_versao_errada() {
+        let (mut wire, n) = sealed(0x11, &[(0xC0, &[0x02])], 1);
+        wire[1] = 0x03; // V3 sem feature: inválida.
+        let mut p = Parser::new();
+        let mut saw_err = false;
+        for &byte in &wire[..n] {
+            if p.feed(byte) == ParserError::ErrVersion {
+                saw_err = true;
+                break;
+            }
         }
-
-        assert!(!parser.has_message());
-        assert!(parser.get_error_count() > 0);
+        assert!(saw_err);
+        assert!(!p.has_message());
     }
 
     #[test]
-    fn test_parser_invalid_signature() {
-        let mut serialized = build_test_message(0x11, 0x42, &[(0xC0, &[0x02])], 1);
-        // Corromper assinatura (byte antes do CRC16)
-        let sig_idx = serialized.len() - 3;
-        serialized[sig_idx] = serialized[sig_idx].wrapping_add(1);
-
-        let mut parser = Parser::new(0x42);
-        for &byte in &serialized {
-            parser.feed(byte);
+    fn test_len_mentiroso_recusa_sem_panico() {
+        // Conta 1, id u8, LEN=33: ErrFieldLen imediato, máquina de volta ao início.
+        let mut p = Parser::new();
+        assert_eq!(p.feed(START_BYTE), ParserError::Ok);
+        // Cabeçalho de 11 B: ver 04, src 6, dst ffff, msg 11, seq 0, count 1, hops 32.
+        for b in [0x04u8, 0x06, 0x00, 0xFF, 0xFF, 0x11, 0x00, 0x00, 1, 32] {
+            assert_eq!(p.feed(b), ParserError::Ok);
         }
-
-        assert!(!parser.has_message());
-        assert!(parser.get_error_count() > 0);
+        assert_eq!(p.feed(0xC0), ParserError::Ok); // id u8
+        assert_eq!(p.feed(33), ParserError::ErrFieldLen); // LEN impossível
+        assert_eq!(p.get_current_state(), ParserState::WaitStart);
+        assert!(!p.has_message());
     }
 
     #[test]
-    fn test_parser_wrong_key() {
-        let serialized = build_test_message(0x11, 0x42, &[(0xC0, &[0x02])], 1);
-        let mut parser = Parser::new(0x43); // Key errada
-
-        for &byte in &serialized {
-            parser.feed(byte);
+    fn test_enxurrada_de_lixo_sem_panico() {
+        // 3000 bytes de ruído determinístico (com âncoras 0xAA pelo meio): a
+        // máquina nunca entra em pânico, conta erros e não inventa mensagens.
+        // (Com comprimentos válidos o tampão de 1205 B nunca transborda por
+        // construção — o máximo válido cabe exato; aqui prova-se a robustez.)
+        let mut p = Parser::new();
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..3000 {
+            // Gerador congruencial simples: determinístico, sem dependências.
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let b = (x >> 16) as u8;
+            let _ = p.feed(b);
         }
-
-        assert!(!parser.has_message());
-        assert!(parser.get_error_count() > 0);
+        assert!(!p.has_message());
+        assert!(p.get_error_count() > 0);
     }
 
     #[test]
-    fn test_parser_invalid_version() {
-        let mut serialized = build_test_message(0x11, 0x42, &[(0xC0, &[0x02])], 1);
-        serialized[1] = 0x99; // Versão inválida
-
-        let mut parser = Parser::new(0x42);
-        for &byte in &serialized {
-            parser.feed(byte);
-        }
-
-        assert!(!parser.has_message());
-        assert!(parser.get_error_count() > 0);
+    fn test_mensagens_consecutivas() {
+        let (m1, n1) = sealed(0x11, &[(0xC0, &[0x01])], 1);
+        let (m2, n2) = sealed(0x16, &[(0xA0, &42u16.to_le_bytes())], 2);
+        let mut p = Parser::new();
+        feed_all(&mut p, &m1[..n1]);
+        assert_eq!(p.get_message().msg_id, 0x11);
+        p.acknowledge();
+        feed_all(&mut p, &m2[..n2]);
+        assert_eq!(p.get_message().msg_id, 0x16);
+        assert_eq!(p.get_success_count(), 2);
+        p.acknowledge();
     }
 
     #[test]
-    fn test_parser_reset() {
-        let mut parser = Parser::new(0x42);
-        parser.feed(START_BYTE);
-        parser.feed(BYTHOS_VERSION);
-        assert_ne!(parser.get_current_state(), ParserState::WaitStart);
-
-        parser.reset();
-        assert_eq!(parser.get_current_state(), ParserState::WaitStart);
-        assert_eq!(parser.raw_offset, 0);
+    fn test_copia_e_sem_mensagem() {
+        let (wire, n) = sealed(0x11, &[(0xC0, &[0x02])], 1);
+        let mut p = Parser::new();
+        let mut out = BythosMessage::new();
+        assert!(!p.copy_message(&mut out));
+        assert!(p.completed_frame().is_none());
+        feed_all(&mut p, &wire[..n]);
+        assert!(p.copy_message(&mut out));
+        assert_eq!(out.msg_id, 0x11);
+        assert_eq!(out.src, 6);
     }
 
     #[test]
-    fn test_parser_copy_message() {
-        let serialized = build_test_message(0x11, 0x42, &[(0xC0, &[0x02])], 1);
-        let mut parser = Parser::new(0x42);
-
-        for &byte in &serialized {
-            parser.feed(byte);
-        }
-
-        let mut output = TLVMessage::new();
-        assert!(parser.copy_message(&mut output));
-        assert_eq!(output.msg_id, 0x11);
-        assert_eq!(output.node_id, 0x06);
-    }
-
-    #[test]
-    fn test_parser_copy_message_no_message() {
-        let parser = Parser::new(0x42);
-        let mut output = TLVMessage::new();
-        assert!(!parser.copy_message(&mut output));
-    }
-
-    #[test]
-    fn test_parser_state_to_string() {
+    fn test_nomes() {
         assert_eq!(parser_state_to_string(ParserState::WaitStart), "WAIT_START");
-        assert_eq!(parser_state_to_string(ParserState::WaitCrc16Hi), "WAIT_CRC16_HI");
-    }
-
-    #[test]
-    fn test_parser_error_to_string() {
+        assert_eq!(
+            parser_state_to_string(ParserState::WaitCrc16Hi),
+            "WAIT_CRC16_HI"
+        );
         assert_eq!(parser_error_to_string(ParserError::Ok), "OK");
-        assert_eq!(parser_error_to_string(ParserError::ErrChecksum), "ERR_CHECKSUM");
-        assert_eq!(parser_error_to_string(ParserError::ErrSignature), "ERR_SIGNATURE");
+        assert_eq!(parser_error_to_string(ParserError::ErrHops), "ERR_HOPS");
+        assert_eq!(
+            parser_error_to_string(ParserError::ErrOverflow),
+            "ERR_OVERFLOW"
+        );
     }
 
     #[test]
-    fn test_parser_consecutive_messages() {
-        let msg1 = build_test_message(0x11, 0x42, &[(0xC0, &[0x01])], 1);
-        let msg2 = build_test_message(0x16, 0x42, &[(0xA0, &42u16.to_le_bytes())], 2);
-        let mut parser = Parser::new(0x42);
-
-        // Primeira mensagem
-        for &byte in &msg1 {
-            parser.feed(byte);
-        }
-        assert!(parser.has_message());
-        assert_eq!(parser.get_message().msg_id, 0x11);
-        parser.acknowledge();
-
-        // Segunda mensagem
-        for &byte in &msg2 {
-            parser.feed(byte);
-        }
-        assert!(parser.has_message());
-        assert_eq!(parser.get_message().msg_id, 0x16);
-        assert_eq!(parser.get_success_count(), 2);
-
-        parser.acknowledge();
-    }
-
-    #[test]
-    fn test_parser_empty_tlv_message() {
-        let serialized = build_test_message(0x10, 0x42, &[], 0); // Heartbeat, sem TLVs
-        let mut parser = Parser::new(0x42);
-
-        for &byte in &serialized {
-            parser.feed(byte);
-        }
-
-        assert!(parser.has_message());
-        let msg = parser.get_message();
-        assert_eq!(msg.msg_id, 0x10);
-        assert_eq!(msg.tlv_count, 0);
-
-        parser.acknowledge();
-    }
-
-    #[test]
-    fn test_parser_field_id_with_type() {
-        // FieldID com tipo embutido: TYPE=1(f32) + ID=0x10 → 0x30
-        let serialized = build_test_message(0x11, 0x42, &[(0x30, &float_to_bytes(1.5))], 3);
-        let mut parser = Parser::new(0x42);
-
-        for &byte in &serialized {
-            parser.feed(byte);
-        }
-
-        assert!(parser.has_message());
-        let msg = parser.get_message();
-        assert_eq!(msg.tlv_count, 1);
-
-        let (field_type, field_id) = field_id_decode(msg.tlvs[0].id);
-        assert_eq!(field_type, FieldType::Float32 as u8);
-        assert_eq!(field_id, 0x10);
-
-        parser.acknowledge();
+    fn test_reset() {
+        let mut p = Parser::new();
+        p.feed(START_BYTE);
+        p.feed(BYTHOS_VERSION);
+        assert_ne!(p.get_current_state(), ParserState::WaitStart);
+        p.reset();
+        assert_eq!(p.get_current_state(), ParserState::WaitStart);
     }
 }

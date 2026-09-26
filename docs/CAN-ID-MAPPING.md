@@ -1,3 +1,5 @@
+> **Nota:** guia histórico da API V3 (nomenclatura CAN/TLV). A norma atual é docs/BYTHOS-SPECIFICATION.md e o mapa de migração docs/MIGRATION-GUIDE.md.
+>
 # Bythos v3.0.0 — Mapeamento CAN ID Extended (29-bit)
 
 ## Estrutura do CAN ID

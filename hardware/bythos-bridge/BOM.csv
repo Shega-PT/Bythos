@@ -1,0 +1,17 @@
+ref,parte,valor,notas
+U1,CH32V003F4P6,~,MCU bridge 48MHz TSSOP20
+U2,ATECC608B-SSHDA,~0.80EUR,seguro SOIC-8; footprint compativel ATSHA204A
+U3,THVD1400DGKR,~,RS-485 dados auto-dir VSON8
+U4,THVD1400DGKR,~,RS-485 relogio (driver sempre-ON no ROOT)
+J1_J2,RJ11-6P4C,~,BEFORE/AFTER (2x por PCB)
+RN1,RN_120R_comutavel,~,terminacao D (ON so em BG-0 modo L)
+RN2,RN_120R_comutavel,~,terminacao CLK (ON so em BG-0 modo L)
+R_SERIE,22R_0402_x4,~,anti-contencao transitoria CLK/D
+D_TVS,SM712-02HTG_x2,~,TVS por par junto ao conector
+F_PTC,MF-PSMF010,~,fusivel resetavel VIN
+U_PWR,AMS1117-3.3_SOT223,~,LDO VIN 3.3-5V
+JP1,jumper_ROOT_NODE,~,ROOT so em BG-0
+JP2,jumper_S_L,~,S curta / L longa
+LED,LED_VD_0805_x2,~,verde=anel vermelho=falha
+C,100n_10u_6V3_conj,~,desacoplamento por IC
+R_I2C,4k7_0402_x2,~,pull-ups I2C <20mm do ATECC608

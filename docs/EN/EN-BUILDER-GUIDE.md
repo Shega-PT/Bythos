@@ -1,3 +1,5 @@
+> **Note:** historical V3 API guide (CAN/TLV naming). Current norm: docs/EN/EN-BYTHOS-SPECIFICATION.md; migration map: docs/EN/EN-MIGRATION-GUIDE.md.
+>
 # Bythos v3.0.0 — Builder Guide
 
 ## Overview

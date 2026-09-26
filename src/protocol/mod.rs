@@ -1,18 +1,19 @@
-//! # Módulo Protocolo Bythos
+//! # Módulo Protocolo Bythos (v4.0.0)
 //!
-//! Implementação completa do protocolo de comunicação binário Bythos v3.0.0.
+//! O fio, por camadas de custo crescente:
 //!
-//! Este módulo fornece:
-//! - Definição de tipos e constantes (`types`) — CAN groups, FieldID com tipo, etc.
-//! - Cálculo CRC-8/SMBUS (`crc8`) — legado, mantido por retrocompatibilidade
-//! - Cálculo CRC-16/CCITT (`crc16`) — checksum padrão do Bythos v3.0.0
-//! - Construção de mensagens Bythos (`builder`)
-//! - Serialização/deserialização e validação (`codec`)
-//! - Camada FFI para interoperação com C/C++ (`ffi`)
+//! - `types` — única fonte de verdade: constantes, endereços, catálogo de campos
+//! - `crc8` — legado V3, mantido para ler o parque antigo em migração
+//! - `crc16` — deteção barata de corrupção acidental (antes do HMAC)
+//! - `secure` — SHA-256 + HMAC + selo + anti-replay (coração da V4)
+//! - `builder` — construção fluente e selada (`BythosBuilder`)
+//! - `codec` — serialização, validação (estrutura e ponta-a-ponta) e análise
+//! - `ffi` — ABI C estável (`bythos_*`)
 
-pub mod types;
-pub mod crc8;
-pub mod crc16;
 pub mod builder;
 pub mod codec;
+pub mod crc16;
+pub mod crc8;
 pub mod ffi;
+pub mod secure;
+pub mod types;

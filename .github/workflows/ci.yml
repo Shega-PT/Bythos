@@ -1,0 +1,70 @@
+# Bythos V4 — integração contínua
+#
+# Prova, em cada push/PR para V4 e main: formato, lint sem avisos, testes Rust
+# (std + no_std), features V4, testes C com o vetor dourado e doc-tests.
+# O firmware ESP32 compila-se à parte (exige toolchain Xtensa + ambiente ESP-IDF).
+
+name: ci
+
+on:
+  push:
+    branches: [V4, main]
+  pull_request:
+    branches: [V4, main]
+
+jobs:
+  rust:
+    name: Rust (fmt + clippy + testes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Formato
+        run: cargo fmt --check
+      - name: Lint (zero avisos)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Testes (std)
+        run: cargo test
+      - name: Prova no_std (compila sem biblioteca padrão)
+        run: cargo build --no-default-features
+      - name: Testes no_std (lógica sem std)
+        run: cargo test --no-default-features --lib
+      - name: Features V4 (sem esp, que exige Xtensa)
+        run: >-
+          cargo build
+          --features bythos-bus-short,bythos-bus-long,bythos-rf-tunnel,secure-element,legacy-v3-compat
+
+  c:
+    name: C (build + testes + bench)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependências
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+      - name: Configurar
+        run: cmake -S c_core -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Compilar (avisos como erros)
+        run: cmake --build build -- -Werror=implicit-function-declaration
+        # Nota: -Wall -Wextra -Wpedantic já vêm do CMakeLists; aqui trava-se
+        # ainda a pior classe (função implícita = API fora de sync com o header).
+      - name: Testes (inclui vetor dourado Rust↔C)
+        run: ./build/test_bythos
+      - name: Benchmark fumaça
+        run: ./build/bench_bythos
+
+  docs:
+    name: Documentação (guias V4 presentes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guias normativos existem
+        run: >-
+          test -f docs/BYTHOS-SPECIFICATION.md &&
+          test -f docs/BYTHOS-BUS.md &&
+          test -f docs/EN/EN-BYTHOS-BUS.md &&
+          test -f docs/MIGRATION-GUIDE.md &&
+          test -f docs/THREAT-MODEL.md &&
+          test -f hardware/bythos-bridge/README.md &&
+          test -f hardware/bythos-bridge/BOM.csv
